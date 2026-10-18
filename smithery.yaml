@@ -1,0 +1,13 @@
+# Smithery.ai configuration: https://smithery.ai/docs/config#smitheryyaml
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for starting this MCP.
+    # This server needs no configuration: no API keys, no options.
+    type: object
+    properties: {}
+  commandFunction:
+    # A function that produces the CLI command to start the MCP on stdio.
+    |-
+    (config) => ({ command: 'uvx', args: ['agent-as-model'] })
+  exampleConfig: {}
