@@ -19,6 +19,7 @@ MISSING_REQUIRED_CLIENT_CAPABILITY error.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated
 
@@ -155,7 +156,7 @@ async def list_models() -> str:
 
 
 def main() -> None:
-    mcp.run_stdio_async()
+    asyncio.run(mcp.run_stdio_async())
 
 
 if __name__ == "__main__":

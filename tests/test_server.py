@@ -151,7 +151,11 @@ def test_default_max_tokens_reaches_host():
 
 def test_main_runs_stdio(monkeypatch):
     calls = []
-    monkeypatch.setattr(SERVER, "run_stdio_async", lambda: calls.append(True))
+
+    async def fake_run_stdio_async():
+        calls.append(True)
+
+    monkeypatch.setattr(SERVER, "run_stdio_async", fake_run_stdio_async)
     agent_server.main()
     assert calls == [True]
 
