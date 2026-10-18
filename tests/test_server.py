@@ -17,7 +17,7 @@ from mcp import types
 from mcp.client import Client
 from mcp.client.session import ClientRequestContext
 
-import server as agent_server
+import agent_as_model.server as agent_server
 
 SERVER = agent_server.mcp
 

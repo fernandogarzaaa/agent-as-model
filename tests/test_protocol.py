@@ -3,7 +3,7 @@
 import pytest
 from mcp.types import CreateMessageResult, ImageContent, TextContent
 
-from protocol import (
+from agent_as_model.protocol import (
     AnthropicContentBlock,
     AnthropicMessage,
     ChatMessage,
