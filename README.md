@@ -2,9 +2,38 @@
 
 A true MCP server where the agent **is** the model and the API key.
 
-Install it on any MCP host (Claude Code, Cursor, Windsurf, any spec-compliant
-client). It exposes product-style completion tools. Every call is fulfilled by
-sampling the host agent's own LLM. No API keys exist anywhere in this system.
+mcp-name: io.github.fernandogarzaaa/agent-as-model
+
+## Install
+
+```bash
+uvx agent-as-model
+```
+
+Claude Code:
+
+```bash
+claude mcp add agent-as-model -- uvx agent-as-model
+```
+
+Any client that takes MCP JSON, paste this:
+
+```json
+{
+  "mcpServers": {
+    "agent-as-model": {
+      "command": "uvx",
+      "args": ["agent-as-model"]
+    }
+  }
+}
+```
+
+Requires Python 3.10+ and a host that declares the MCP `sampling`
+capability. No API keys, ever.
+
+From a local checkout: `python -m agent_as_model`. From the repo
+without installing: `uvx --from git+https://github.com/fernandogarzaaa/agent-as-model agent-as-model`.
 
 ## The idea
 
@@ -12,40 +41,6 @@ AI products usually demand a model API key before they do anything useful.
 This server flips that around. The tools speak the request shapes products
 already use, and the intelligence comes from the agent on the other end of
 the MCP connection. The agent is the model. The agent is the key.
-
-## Install
-
-Requires Python 3.10+ and a host that declares the MCP `sampling`
-capability. No API keys, ever.
-
-Run it straight from the repo with uvx (no install step):
-
-```bash
-claude mcp add agent-as-model -- uvx --from git+https://github.com/fernandogarzaaa/agent-as-model agent-as-model
-```
-
-Or install it for real:
-
-```bash
-pipx install git+https://github.com/fernandogarzaaa/agent-as-model
-# then
-claude mcp add agent-as-model -- agent-as-model
-```
-
-Cursor, Windsurf, or any client that takes MCP JSON:
-
-```json
-{
-  "mcpServers": {
-    "agent-as-model": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/fernandogarzaaa/agent-as-model", "agent-as-model"]
-    }
-  }
-}
-```
-
-From a local checkout: `python -m agent_as_model`.
 
 ## Tools
 
