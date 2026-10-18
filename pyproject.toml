@@ -1,0 +1,13 @@
+[project]
+name = "agent-as-model"
+version = "0.1.0"
+description = "A true MCP server where the agent is the model and the API key."
+requires-python = ">=3.10"
+dependencies = ["mcp>=2,<3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

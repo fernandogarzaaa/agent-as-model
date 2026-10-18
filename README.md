@@ -15,21 +15,13 @@ the MCP connection. The agent is the model. The agent is the key.
 
 ## Install
 
-Requires Python 3.10+ and a host that declares the MCP `sampling`
-capability. No API keys, ever.
+Requires the `mcp` Python package v2 (`pip install "mcp>=2,<3"`) and a host
+that declares the MCP `sampling` capability.
 
-Run it straight from the repo with uvx (no install step):
-
-```bash
-claude mcp add agent-as-model -- uvx --from git+https://github.com/fernandogarzaaa/agent-as-model agent-as-model
-```
-
-Or install it for real:
+Claude Code:
 
 ```bash
-pipx install git+https://github.com/fernandogarzaaa/agent-as-model
-# then
-claude mcp add agent-as-model -- agent-as-model
+claude mcp add agent-as-model -- python3 /path/to/agent-as-model/server.py
 ```
 
 Cursor, Windsurf, or any client that takes MCP JSON:
@@ -38,14 +30,12 @@ Cursor, Windsurf, or any client that takes MCP JSON:
 {
   "mcpServers": {
     "agent-as-model": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/fernandogarzaaa/agent-as-model", "agent-as-model"]
+      "command": "python3",
+      "args": ["/path/to/agent-as-model/server.py"]
     }
   }
 }
 ```
-
-From a local checkout: `python -m agent_as_model`.
 
 ## Tools
 
