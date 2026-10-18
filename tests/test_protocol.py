@@ -73,6 +73,11 @@ def test_anthropic_no_system():
     assert system_prompt is None
 
 
+def test_anthropic_empty_messages_rejected():
+    with pytest.raises(ValueError, match="non-empty"):
+        anthropic_to_sampling([], None)
+
+
 def test_extract_text_returns_text():
     result = CreateMessageResult(
         role="assistant",

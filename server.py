@@ -149,8 +149,7 @@ async def list_models() -> str:
                     "Alias for the MCP host's own model, reached via sampling. No API key required."
                 ),
             }
-        ],
-        indent=2,
+        ]
     )
 
 

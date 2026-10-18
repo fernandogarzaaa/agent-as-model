@@ -135,6 +135,27 @@ def test_list_models():
     _run(go)
 
 
+def test_default_max_tokens_reaches_host():
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            for tool_name, args in (
+                ("chat_complete", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("messages_create", {"messages": [{"role": "user", "content": "Hi"}]}),
+            ):
+                result = await client.call_tool(tool_name, args)
+                seen = json.loads(_tool_text(result).removeprefix("CANNED:"))
+                assert seen["max_tokens"] == 4096
+
+    _run(go)
+
+
+def test_main_runs_stdio(monkeypatch):
+    calls = []
+    monkeypatch.setattr(SERVER, "run_stdio_async", lambda: calls.append(True))
+    agent_server.main()
+    assert calls == [True]
+
+
 def test_missing_sampling_capability_fails_clearly():
     async def go():
         async with Client(SERVER) as client:  # no sampling_callback
