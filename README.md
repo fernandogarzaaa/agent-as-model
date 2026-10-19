@@ -68,10 +68,12 @@ an alias for the host agent's own model.
 ## How it works
 
 1. A product (or agent) calls `chat_complete` with ordinary chat messages.
-2. The server translates them into MCP sampling messages and asks the host
-   to complete them. On pre-2026 connections this is a direct
-   `sampling/createMessage` request. On 2026-07-28+ it rides the
-   multi-round-trip pattern. One tool body serves both eras.
+2. The server translates them into a completion payload and asks the host
+   to complete it. On pre-2026 connections this is a direct
+   `sampling/createMessage` request. On 2026-07-28+ the server returns a
+   multi-round-trip `InputRequiredResult` carrying the full payload instead
+   of calling the sampling API, and the completion arrives on the retry
+   round. One tool body serves both eras.
 3. The host agent generates the completion with its own model and the server
    returns the text. The `model` argument is passed to the host as a model
    hint only; `agent-default` means "your own model".
@@ -84,8 +86,9 @@ an alias for the host agent's own model.
   not the keys. The era-portable form used here is the sanctioned way to
   keep it working across both spec eras.
 - The host is in charge. Sampling runs under the host's consent and policy.
-  A host without the sampling capability gets a clear
-  `MISSING_REQUIRED_CLIENT_CAPABILITY` error, not a silent failure.
+  On pre-2026-07-28 connections a host without the sampling capability gets
+  a clear `MISSING_REQUIRED_CLIENT_CAPABILITY` error, not a silent failure.
+  The 2026-07-28+ MRTR path needs no sampling capability at all.
 - Latency is one host model call per tool call. This is a thinking
   endpoint, not a fast one.
 - v1 serves text only. Tool calls, images, and audio in either direction
