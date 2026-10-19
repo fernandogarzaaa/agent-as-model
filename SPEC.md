@@ -25,8 +25,11 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
 - `protocol.py`: pure translation. OpenAI chat messages and Anthropic
   messages into `SamplingMessage` lists plus a system prompt. Text
   extraction from sampling results. No I/O, no keys.
-- `server.py`: `MCPServer` (official Python SDK v2) over stdio with three
-  tools. Sampling goes through `Resolve`/`Sample` resolver injection, which
+- `server.py`: `MCPServer` (official Python SDK v2) over stdio with four
+  tools: `chat_complete` and `messages_create` (chat-shaped completion), the
+  raw `generate` tool (a plain prompt sent as a single user sampling message
+  with no system prompt, no chat formatting overhead), and `list_models`.
+  Sampling goes through `Resolve`/`Sample` resolver injection, which
   is the era-portable form: direct `sampling/createMessage` before
   2026-07-28, `InputRequiredResult` multi-round-trip on 2026-07-28+.
 - The `model` tool argument becomes an MCP model hint. `agent-default`
@@ -40,6 +43,12 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   the architecture is the product, the deprecation floor is 2027-07-28 at
   the earliest, and the resolver form migrates cleanly to whatever
   succeeds sampling.
+- `generate` is the thin path: raw prompt in, completion text out, same
+  host model, no chat formatting. The prompt becomes a single user sampling
+  message with no system prompt; `model`, `temperature`, and `max_tokens`
+  behave exactly as on the chat tools. No `tools`, no `output_schema`, no
+  `tool_choice`: those are chat-tool features, and generate stays zero
+  overhead by leaving them out.
 - Capability failures are loud. A host without `sampling` gets
   `MISSING_REQUIRED_CLIENT_CAPABILITY`, never an empty completion.
 - Non-text sampling results raise instead of being stringified.
@@ -72,11 +81,13 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
 ## Verification
 
 - `tests/test_protocol.py`: 8 unit tests over translation and extraction.
-- `tests/test_server.py`: 6 end-to-end tests with the in-process SDK client
+- `tests/test_server.py`: end-to-end tests with the in-process SDK client
   and a scripted sampling host: tool listing (Resolve param hidden from
   schemas), `chat_complete` on both protocol eras with wire-level
   assertions (system prompt, messages, temperature, max tokens, model
-  hints), `messages_create`, `list_models`, and the no-sampling error path.
+  hints), `messages_create`, `list_models`, the no-sampling error path, and
+  `generate` (prompt as a single user message with no system prompt on both
+  eras, params pass-through, tool listing, description).
 - `ruff format` and `ruff check` clean.
 - Standing implementation gate: testteeth mutation run on touched code
   (see commit log for the score).

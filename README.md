@@ -62,6 +62,14 @@ the MCP connection. The agent is the model. The agent is the key.
 `system` accepts a string or a list of text blocks. Message content accepts a
 string or a list of text blocks.
 
+**generate** — raw prompt string in, completion text out, same host model, no
+chat formatting. The thin path for callers that do not need chat shapes: the
+prompt is sent as a single user sampling message with no system prompt and no
+role translation. `model`, `temperature`, and `max_tokens` behave exactly as
+on the other tools; there are no `tools`, `output_schema`, or `tool_choice`
+parameters, because those are chat-tool features and generate is zero
+overhead.
+
 **list_models** — returns the one model this server offers: `agent-default`,
 an alias for the host agent's own model.
 
@@ -141,11 +149,13 @@ python3 -m pytest tests/ -q
 python3 -m ruff format . && python3 -m ruff check .
 ```
 
-53 tests, all green: message translation unit tests plus end-to-end runs of
+58 tests, all green: message translation unit tests plus end-to-end runs of
 the full MCP loop (tool call to sampled completion) against a scripted host
 on both the modern multi-round-trip era and the legacy direct-sampling era,
 including the structured-output paths (single required tool in the sampling
-params and MRTR payload, validation success, and loud validation failure)
-and the tool-use passthrough paths (tools and tool_choice forwarded on both
+params and MRTR payload, validation success, and loud validation failure),
+the tool-use passthrough paths (tools and tool_choice forwarded on both
 eras, capability-absent degradation to plain text with an explicit logged
-warning, documented JSON result shape, and the tools/output_schema conflict).
+warning, documented JSON result shape, and the tools/output_schema conflict),
+and the generate tool (single user message with no system prompt and no
+tools on both eras, param pass-through, tool listing, description).

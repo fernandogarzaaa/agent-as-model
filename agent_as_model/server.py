@@ -7,6 +7,7 @@ the host agent's own LLM. No API keys exist anywhere in this system.
 Tools:
   chat_complete   OpenAI chat-completions-shaped request -> completion text
   messages_create Anthropic messages-shaped request -> completion text
+  generate        raw prompt string -> completion text (same host model, no chat formatting)
   list_models     the model this server offers (the host's own model, aliased)
 
 Both completion tools accept an optional output_schema (a JSON Schema object).
@@ -676,6 +677,41 @@ async def messages_create(
         tool_choice=tool_choice,
     )
     return await _complete(ctx, params, output_schema, tools=validated_tools)
+
+
+@mcp.tool(
+    description=(
+        "Generate a raw text completion from a plain prompt string. "
+        "The prompt is sent as a single user sampling message with no system prompt "
+        "and no chat formatting: raw prompt in, completion text out, produced by "
+        "the host agent's own model. Same model hint and parameters as the other "
+        "completion tools, minus any chat or tool features: no tools, no "
+        "output_schema, no tool_choice. "
+        "No API key is used or needed: the connected agent is the model."
+    )
+)
+async def generate(
+    ctx: Context,
+    prompt: Annotated[
+        str, Field(description="The raw prompt text to complete. No chat formatting applied.")
+    ],
+    model: Annotated[
+        str, Field(description="Model alias; agent-default means the host's own model.")
+    ] = "agent-default",
+    temperature: Annotated[
+        float | None, Field(description="Sampling temperature, if the host honors it.")
+    ] = None,
+    max_tokens: Annotated[int, Field(description="Maximum tokens to generate.")] = 4096,
+) -> str | InputRequiredResult:
+    """Generate a completion from a raw prompt with the host agent's model."""
+    params = _sampling_params(
+        [SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
+        None,
+        temperature,
+        max_tokens,
+        model,
+    )
+    return await _complete(ctx, params)
 
 
 @mcp.tool(

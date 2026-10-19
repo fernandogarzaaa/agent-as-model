@@ -1051,3 +1051,117 @@ def test_sampling_params_with_tools():
     bare = agent_server._sampling_params([], None, None, 10, "agent-default")
     assert bare.tools is None
     assert bare.tool_choice is None
+
+
+# ---------------------------------------------------------------------------
+# Item 9: generate-shaped raw completion tool
+# ---------------------------------------------------------------------------
+
+
+def test_generate_listed_with_others():
+    """generate is listed alongside the other tools; the ctx param stays
+    hidden; the schema exposes only prompt/model/temperature/max_tokens:
+    no chat-tool surface (tools, output_schema, tool_choice)."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            names = {t.name for t in tools.tools}
+            assert {"chat_complete", "messages_create", "list_models", "generate"} <= names
+            tool = next(t for t in tools.tools if t.name == "generate")
+            props = tool.input_schema.get("properties", {})
+            assert "ctx" not in props
+            assert "prompt" in props
+            assert "tools" not in props
+            assert "output_schema" not in props
+            assert "tool_choice" not in props
+            required = tool.input_schema.get("required", [])
+            assert "prompt" in required
+
+    _run(go)
+
+
+def test_generate_modern_era_full_loop():
+    """Modern era: the full MRTR loop returns the completion; params pass
+    through (temperature, max_tokens, model hint); the prompt arrives as a
+    single user message with no system prompt."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "generate",
+                {
+                    "prompt": "Write a haiku about sampling.",
+                    "model": "custom-model",
+                    "temperature": 0.7,
+                    "max_tokens": 200,
+                },
+            )
+            seen = json.loads(_tool_text(result).removeprefix("CANNED:"))
+            assert seen["messages"] == [["user", "Write a haiku about sampling."]]
+            assert seen["system_prompt"] is None
+            assert seen["temperature"] == 0.7
+            assert seen["max_tokens"] == 200
+            assert seen["hints"] == ["custom-model"]
+
+    _run(go)
+
+
+def test_generate_modern_era_input_required_payload():
+    """Modern era, round one: the InputRequiredResult payload carries the
+    prompt as a single user message with no system prompt, and carries no
+    tools, no tool choice, no output schema: the zero-overhead thin path."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            first = await client.session.call_tool(
+                "generate",
+                {"prompt": "Say the word hello."},
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert [(m.role, m.content.text) for m in params.messages] == [
+                ("user", "Say the word hello.")
+            ]
+            assert params.system_prompt is None
+            assert params.tools is None
+            assert params.tool_choice is None
+            assert params.temperature is None
+            assert params.max_tokens == 4096
+            assert [h.name for h in params.model_preferences.hints] == ["agent-default"]
+            assert first.request_state
+
+    _run(go)
+
+
+def test_generate_legacy_era():
+    """Legacy era: direct sampling/createMessage with the prompt as the only
+    message, no system prompt, default params."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool("generate", {"prompt": "Ping"})
+            seen = json.loads(_tool_text(result).removeprefix("CANNED:"))
+            assert seen["messages"] == [["user", "Ping"]]
+            assert seen["system_prompt"] is None
+            assert seen["temperature"] is None
+            assert seen["max_tokens"] == 4096
+
+    _run(go)
+
+
+def test_generate_description_states_raw_in_text_out():
+    """The tool description says plainly what it is: raw prompt in,
+    completion text out, same host model, no chat formatting."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            tool = next(t for t in tools.tools if t.name == "generate")
+            description = tool.description.lower()
+            assert "raw" in description
+            assert "no chat formatting" in description
+            assert "host agent's own model" in description
+
+    _run(go)
