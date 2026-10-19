@@ -9,6 +9,13 @@ Tools:
   messages_create Anthropic messages-shaped request -> completion text
   list_models     the model this server offers (the host's own model, aliased)
 
+Both completion tools accept an optional output_schema (a JSON Schema object).
+When given, the sampling request carries exactly one tool whose input schema
+is that schema, marked as the required tool choice (the toolChoice-required
+trick): the host must answer by invoking the tool, and the server validates
+the tool-use input against the schema before returning it as JSON text.
+Invalid host output fails loudly instead of being returned silently.
+
 Era handling is explicit. The tool body reads the negotiated protocol
 version from the request Context and dispatches:
 
@@ -35,6 +42,7 @@ import asyncio
 import json
 from typing import Annotated
 
+import jsonschema
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
@@ -53,6 +61,9 @@ from mcp.types import (
     ModelPreferences,
     SamplingCapability,
     SamplingMessage,
+    Tool,
+    ToolChoice,
+    ToolUseContent,
 )
 from mcp_types.version import is_version_at_least
 from pydantic import Field
@@ -84,6 +95,13 @@ _MODERN_ERA = "2026-07-28"
 # Server-assigned key under which the MRTR input request asks the host for
 # the completion. The host retries the tool call with its response for this key.
 _SAMPLE_INPUT_KEY = "sample"
+
+# Name of the single sampling tool the toolChoice-required trick constrains
+# the host to. SEP-1577's required tool choice has no per-name selector in the
+# SDK (ToolChoice carries only mode); pairing mode="required" with exactly one
+# tool forces the host to answer by invoking that tool, so its input IS the
+# structured completion.
+_STRUCTURED_OUTPUT_TOOL_NAME = "structured_output"
 
 
 def _is_modern_era(protocol_version: str | None) -> bool:
@@ -130,39 +148,136 @@ def _require_sampling_capability(ctx: Context) -> None:
     )
 
 
+def _require_object_schema(output_schema: object) -> dict:
+    """Validate the caller's output_schema before it travels anywhere.
+
+    The single required tool carries it as its input schema, so it must be a
+    JSON Schema object with root type "object", and it must itself be a valid
+    schema. A bad schema is the caller's bug: fail here, loudly, not mid-flow.
+    """
+    if not isinstance(output_schema, dict) or output_schema.get("type") != "object":
+        raise ToolError(
+            "output_schema must be a JSON Schema object with root type 'object' "
+            f"(got {type(output_schema).__name__}); the single required sampling tool "
+            "carries it as its input schema"
+        )
+    try:
+        jsonschema.Draft202012Validator.check_schema(output_schema)
+    except jsonschema.SchemaError as exc:
+        raise ToolError(f"output_schema is not a valid JSON Schema: {exc.message}") from exc
+    return output_schema
+
+
 def _sampling_params(
     messages: list[SamplingMessage],
     system_prompt: str | None,
     temperature: float | None,
     max_tokens: int,
     model: str,
+    output_schema: dict | None = None,
 ) -> CreateMessageRequestParams:
     """Build the request payload every era path carries: messages, system
-    prompt, temperature, max_tokens, and the model hint."""
+    prompt, temperature, max_tokens, and the model hint.
+
+    When output_schema is given, the request carries exactly one tool whose
+    input schema is that schema, marked as the required tool choice: the
+    toolChoice-required trick for structured output. The host must answer by
+    invoking the tool, so its tool-use input is the structured completion.
+    """
+    tools: list[Tool] | None = None
+    tool_choice: ToolChoice | None = None
+    if output_schema is not None:
+        tools = [
+            Tool(
+                name=_STRUCTURED_OUTPUT_TOOL_NAME,
+                description=(
+                    "Return the completion as structured data matching this "
+                    "tool's input schema. You must call this tool."
+                ),
+                input_schema=_require_object_schema(output_schema),
+            )
+        ]
+        tool_choice = ToolChoice(mode="required")
     return CreateMessageRequestParams(
         messages=messages,
         system_prompt=system_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
         model_preferences=ModelPreferences(hints=[ModelHint(name=model)]),
+        tools=tools,
+        tool_choice=tool_choice,
     )
 
 
-async def _legacy_sample(ctx: Context, params: CreateMessageRequestParams) -> str:
+async def _legacy_sample(
+    ctx: Context, params: CreateMessageRequestParams, output_schema: dict | None = None
+) -> str:
     """Direct sampling/createMessage for pre-2026-07-28 connections.
 
     The era gate forbids this on modern connections; the sampling capability
-    gate fails loud when the host did not declare it.
+    gate fails loud when the host did not declare it. With an output_schema
+    the required-tool response is extracted and validated against it.
     """
     _assert_legacy_sampling_allowed(ctx.protocol_version)
     if ctx.session.can_send_request:
         _require_sampling_capability(ctx)
-    result = await ctx.session.send_request(
+    if output_schema is None:
+        result = await ctx.session.send_request(
+            CreateMessageRequest(params=params),
+            CreateMessageResult,
+            metadata=ServerMessageMetadata(related_request_id=ctx.request_id),
+        )
+        return extract_text(result)
+    with_tools = await ctx.session.send_request(
         CreateMessageRequest(params=params),
-        CreateMessageResult,
+        CreateMessageResultWithTools,
         metadata=ServerMessageMetadata(related_request_id=ctx.request_id),
     )
-    return extract_text(result)
+    output = _extract_structured_output(with_tools)
+    _validate_structured_output(output, output_schema)
+    return json.dumps(output, sort_keys=True)
+
+
+def _extract_structured_output(result: CreateMessageResultWithTools) -> dict:
+    """Pull the structured completion out of the host's required-tool response.
+
+    The toolChoice-required trick constrains the host to a single tool, so it
+    answers by invoking that tool; the tool-use input dict IS the structured
+    completion. A response with no such tool use is a host contract violation:
+    reject it, never silently stringify it.
+    """
+    uses = [
+        block
+        for block in result.content_as_list
+        if isinstance(block, ToolUseContent) and block.name == _STRUCTURED_OUTPUT_TOOL_NAME
+    ]
+    if not uses:
+        raise ToolError(
+            f"output_schema requested a structured tool-use response, but the host's "
+            f"completion contains no {_STRUCTURED_OUTPUT_TOOL_NAME!r} tool use; "
+            "the completion was rejected rather than returned as-is"
+        )
+    return uses[0].input
+
+
+def _validate_structured_output(output: dict, output_schema: dict) -> None:
+    """Gate: the host's structured completion must satisfy the caller's schema.
+
+    Raises ToolError naming the exact mismatch. Bad output is never returned
+    silently, and the schema is never dropped.
+    """
+    try:
+        jsonschema.validate(instance=output, schema=output_schema)
+    except jsonschema.ValidationError as exc:
+        location = (
+            "/" + "/".join(str(part) for part in exc.absolute_path)
+            if exc.absolute_path
+            else "(root)"
+        )
+        raise ToolError(
+            f"Host completion failed output-schema validation at {location}: {exc.message}; "
+            "the completion was rejected rather than returned as-is"
+        ) from exc
 
 
 def _mrtr_completion_request(params: CreateMessageRequestParams) -> InputRequiredResult:
@@ -178,14 +293,30 @@ def _mrtr_completion_request(params: CreateMessageRequestParams) -> InputRequire
     )
 
 
-def _mrtr_completion_result(ctx: Context) -> str | None:
-    """Second MRTR round: the host's fulfilled completion, or None on round one."""
+def _mrtr_completion_result(ctx: Context, output_schema: dict | None = None) -> str | None:
+    """Second MRTR round: the host's fulfilled completion, or None on round one.
+
+    With an output_schema the host must answer through the required tool: the
+    tool-use input is extracted and validated, and a plain-text answer is a
+    contract violation, not a completion.
+    """
     responses = ctx.input_responses
     if not responses:
         return None
     response = responses.get(_SAMPLE_INPUT_KEY)
     if response is None:
         return None
+    if output_schema is not None:
+        if not isinstance(response, CreateMessageResultWithTools):
+            raise ToolError(
+                f"output_schema requested a structured tool-use response for "
+                f"{_SAMPLE_INPUT_KEY!r}, but the host returned "
+                f"{type(response).__name__}; the required-tool constraint was "
+                "not honored, so the completion was rejected"
+            )
+        output = _extract_structured_output(response)
+        _validate_structured_output(output, output_schema)
+        return json.dumps(output, sort_keys=True)
     if isinstance(response, CreateMessageResult | CreateMessageResultWithTools):
         return extract_text(response)
     raise ToolError(
@@ -195,14 +326,16 @@ def _mrtr_completion_result(ctx: Context) -> str | None:
     )
 
 
-async def _complete(ctx: Context, params: CreateMessageRequestParams) -> str | InputRequiredResult:
+async def _complete(
+    ctx: Context, params: CreateMessageRequestParams, output_schema: dict | None = None
+) -> str | InputRequiredResult:
     """Era dispatch: MRTR InputRequiredResult on 2026-07-28+, direct sampling before."""
     if _is_modern_era(ctx.protocol_version):
-        completed = _mrtr_completion_result(ctx)
+        completed = _mrtr_completion_result(ctx, output_schema)
         if completed is None:
             return _mrtr_completion_request(params)
         return completed
-    return await _legacy_sample(ctx, params)
+    return await _legacy_sample(ctx, params, output_schema)
 
 
 @mcp.tool(
@@ -211,6 +344,9 @@ async def _complete(ctx: Context, params: CreateMessageRequestParams) -> str | I
         "The completion is produced by the host agent's own model: direct MCP sampling "
         "on pre-2026-07-28 connections, an MRTR InputRequiredResult carrying the "
         "request payload on 2026-07-28+. "
+        "When output_schema is given, the request carries exactly one required tool "
+        "whose input schema is that schema, and the validated structured completion "
+        "is returned as JSON text. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -227,11 +363,23 @@ async def chat_complete(
         float | None, Field(description="Sampling temperature, if the host honors it.")
     ] = None,
     max_tokens: Annotated[int, Field(description="Maximum tokens to generate.")] = 4096,
+    output_schema: Annotated[
+        dict | None,
+        Field(
+            description=(
+                "Optional JSON Schema (root type object). When given, the sampling "
+                "request carries exactly one required tool with this input schema "
+                "and the completion is validated against it before returning."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a chat with the host agent's model (OpenAI request shape)."""
     system_prompt, sampling_messages = openai_to_sampling(messages)
-    params = _sampling_params(sampling_messages, system_prompt, temperature, max_tokens, model)
-    return await _complete(ctx, params)
+    params = _sampling_params(
+        sampling_messages, system_prompt, temperature, max_tokens, model, output_schema
+    )
+    return await _complete(ctx, params, output_schema)
 
 
 @mcp.tool(
@@ -240,6 +388,9 @@ async def chat_complete(
         "The completion is produced by the host agent's own model: direct MCP sampling "
         "on pre-2026-07-28 connections, an MRTR InputRequiredResult carrying the "
         "request payload on 2026-07-28+. "
+        "When output_schema is given, the request carries exactly one required tool "
+        "whose input schema is that schema, and the validated structured completion "
+        "is returned as JSON text. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -259,11 +410,23 @@ async def messages_create(
         float | None, Field(description="Sampling temperature, if the host honors it.")
     ] = None,
     max_tokens: Annotated[int, Field(description="Maximum tokens to generate.")] = 4096,
+    output_schema: Annotated[
+        dict | None,
+        Field(
+            description=(
+                "Optional JSON Schema (root type object). When given, the sampling "
+                "request carries exactly one required tool with this input schema "
+                "and the completion is validated against it before returning."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a conversation with the host agent's model (Anthropic request shape)."""
     system_prompt, sampling_messages = anthropic_to_sampling(messages, system)
-    params = _sampling_params(sampling_messages, system_prompt, temperature, max_tokens, model)
-    return await _complete(ctx, params)
+    params = _sampling_params(
+        sampling_messages, system_prompt, temperature, max_tokens, model, output_schema
+    )
+    return await _complete(ctx, params, output_schema)
 
 
 @mcp.tool(

@@ -331,3 +331,287 @@ def test_legacy_sampling_gate_forbids_modern_era():
     # Legacy versions pass the gate without raising.
     agent_server._assert_legacy_sampling_allowed("2025-11-25")
     agent_server._assert_legacy_sampling_allowed(None)
+
+
+_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _structured_sampler_factory(output, schema=_OUTPUT_SCHEMA):
+    """Stand in for a host that honors the required tool: assert the single
+    required tool is in the sampling params, then answer through it."""
+
+    async def sampler(context, params):
+        assert params.tools is not None and len(params.tools) == 1
+        tool = params.tools[0]
+        assert tool.name == "structured_output"
+        assert tool.input_schema == schema
+        assert params.tool_choice is not None
+        assert params.tool_choice.mode == "required"
+        return types.CreateMessageResultWithTools(
+            role="assistant",
+            content=[
+                types.ToolUseContent(
+                    type="tool_use",
+                    name="structured_output",
+                    id="tool-1",
+                    input=output,
+                )
+            ],
+            model="test-host-model",
+            stop_reason="toolUse",
+        )
+
+    return sampler
+
+
+def _tool_use_result(output):
+    return types.CreateMessageResultWithTools(
+        role="assistant",
+        content=[
+            types.ToolUseContent(
+                type="tool_use", name="structured_output", id="tool-1", input=output
+            )
+        ],
+        model="test-host-model",
+        stop_reason="toolUse",
+    )
+
+
+def test_output_schema_exposed_in_tool_schemas():
+    """Both tools advertise output_schema; the ctx param stays hidden."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            for name in ("chat_complete", "messages_create"):
+                tool = next(t for t in tools.tools if t.name == name)
+                props = tool.input_schema.get("properties", {})
+                assert "output_schema" in props
+                assert "ctx" not in props
+
+    _run(go)
+
+
+def test_output_schema_legacy_era_single_required_tool():
+    """Legacy era: with output_schema the sampling params carry exactly one
+    required tool whose input schema is the schema; the validated structured
+    completion returns as JSON text. Both tools."""
+
+    async def go():
+        sampler = _structured_sampler_factory({"answer": "yes", "confidence": 0.9})
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            for tool_name, args in (
+                (
+                    "chat_complete",
+                    {
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "output_schema": _OUTPUT_SCHEMA,
+                    },
+                ),
+                (
+                    "messages_create",
+                    {
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "output_schema": _OUTPUT_SCHEMA,
+                    },
+                ),
+            ):
+                result = await client.call_tool(tool_name, args)
+                assert json.loads(_tool_text(result)) == {"answer": "yes", "confidence": 0.9}
+
+    _run(go)
+
+
+def test_output_schema_modern_era_payload_carries_required_tool():
+    """Modern era, round one: the InputRequiredResult payload carries the
+    single required tool in both the input request and the request_state."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            first = await client.session.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "output_schema": _OUTPUT_SCHEMA,
+                },
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert len(params.tools) == 1
+            assert params.tools[0].name == "structured_output"
+            assert params.tools[0].input_schema == _OUTPUT_SCHEMA
+            assert params.tool_choice.mode == "required"
+
+            # request_state is sealed by the server kernel on the wire (opaque to
+            # the client by spec); its raw shape is pinned at the unit level below.
+            assert first.request_state
+
+    _run(go)
+
+
+def test_output_schema_modern_era_request_state_carries_required_tool():
+    """Unit level: the MRTR request_state JSON carries the single required tool."""
+    params = agent_server._sampling_params(
+        [types.SamplingMessage(role="user", content=types.TextContent(type="text", text="Hi"))],
+        None,
+        None,
+        100,
+        "agent-default",
+        _OUTPUT_SCHEMA,
+    )
+    result = agent_server._mrtr_completion_request(params)
+    state = json.loads(result.request_state)
+    assert len(state["tools"]) == 1
+    assert state["tools"][0]["name"] == "structured_output"
+    assert state["tools"][0]["inputSchema"] == _OUTPUT_SCHEMA
+    assert state["toolChoice"] == {"mode": "required"}
+
+
+def test_output_schema_modern_era_full_loop():
+    """Modern era, full MRTR loop: the host's tool-use answer is extracted,
+    validated, and returned as JSON text."""
+
+    async def go():
+        sampler = _structured_sampler_factory({"answer": "structured hi"})
+        async with Client(SERVER, sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "messages_create",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "output_schema": _OUTPUT_SCHEMA,
+                },
+            )
+            assert json.loads(_tool_text(result)) == {"answer": "structured hi"}
+
+    _run(go)
+
+
+def test_output_schema_validation_failure_raises_legacy():
+    """Legacy era: host output violating the schema fails loud, naming the
+    mismatch, instead of being returned silently."""
+
+    async def go():
+        sampler = _structured_sampler_factory({"answer": "ok", "confidence": "not-a-number"})
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "output_schema": _OUTPUT_SCHEMA,
+                },
+            )
+            assert result.is_error
+            text = _tool_text(result)
+            assert "output-schema validation" in text
+            assert "confidence" in text
+
+    _run(go)
+
+
+def test_mrtr_completion_result_schema_success_and_failure():
+    """Modern round two: valid structured output returns as JSON; invalid
+    output raises naming the mismatch."""
+    good = SimpleNamespace(input_responses={"sample": _tool_use_result({"answer": "ok"})})
+    assert json.loads(agent_server._mrtr_completion_result(good, _OUTPUT_SCHEMA)) == {
+        "answer": "ok"
+    }
+
+    bad = SimpleNamespace(
+        input_responses={"sample": _tool_use_result({"answer": "ok", "confidence": "x"})}
+    )
+    with pytest.raises(ToolError, match="output-schema validation") as excinfo:
+        agent_server._mrtr_completion_result(bad, _OUTPUT_SCHEMA)
+    assert "confidence" in str(excinfo.value)
+
+
+def test_mrtr_completion_result_schema_rejects_plain_text():
+    """Modern round two with a schema: a plain-text host answer is a contract
+    violation, not a completion."""
+    plain = types.CreateMessageResult(
+        role="assistant",
+        content=types.TextContent(type="text", text="hi"),
+        model="test-host-model",
+        stop_reason="endTurn",
+    )
+    ctx = SimpleNamespace(input_responses={"sample": plain})
+    with pytest.raises(ToolError, match="not honored"):
+        agent_server._mrtr_completion_result(ctx, _OUTPUT_SCHEMA)
+
+
+def test_extract_structured_output_requires_tool_use():
+    """A WithTools response with no structured_output tool use is rejected."""
+    text_only = types.CreateMessageResultWithTools(
+        role="assistant",
+        content=[types.TextContent(type="text", text="no tools here")],
+        model="test-host-model",
+        stop_reason="endTurn",
+    )
+    with pytest.raises(ToolError, match="no 'structured_output' tool use"):
+        agent_server._extract_structured_output(text_only)
+
+
+def test_output_schema_returns_canonical_sorted_json():
+    """The validated completion is returned with deterministically sorted keys,
+    whatever order the host's tool-use input used. Both era paths."""
+    schema = {
+        "type": "object",
+        "properties": {"zebra": {"type": "integer"}, "apple": {"type": "integer"}},
+    }
+    sampler = _structured_sampler_factory({"zebra": 1, "apple": 2}, schema)
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "chat_complete",
+                {"messages": [{"role": "user", "content": "Hi"}], "output_schema": schema},
+            )
+            assert _tool_text(result) == '{"apple": 2, "zebra": 1}'
+
+    _run(go)
+
+    ctx = SimpleNamespace(input_responses={"sample": _tool_use_result({"zebra": 1, "apple": 2})})
+    assert agent_server._mrtr_completion_result(ctx, schema) == '{"apple": 2, "zebra": 1}'
+
+
+def test_extract_structured_output_returns_input():
+    result = _tool_use_result({"answer": "x", "confidence": 1.0})
+    assert agent_server._extract_structured_output(result) == {"answer": "x", "confidence": 1.0}
+
+
+def test_require_object_schema_rejects_bad_schemas():
+    """Non-object roots, non-dicts, and invalid JSON Schemas fail at the gate."""
+    with pytest.raises(ToolError, match="root type 'object'"):
+        agent_server._require_object_schema({"type": "array"})
+    with pytest.raises(ToolError, match="root type 'object'"):
+        agent_server._require_object_schema(["not", "a", "dict"])
+    with pytest.raises(ToolError, match="not a valid JSON Schema"):
+        agent_server._require_object_schema(
+            {"type": "object", "properties": {"x": {"type": "bogus"}}}
+        )
+    assert agent_server._require_object_schema(_OUTPUT_SCHEMA) == _OUTPUT_SCHEMA
+
+
+def test_sampling_params_without_schema_carries_no_tools():
+    """The default path is untouched: no tools, no tool choice, exactly the
+    pinned payload shape."""
+    params = agent_server._sampling_params([], None, None, 10, "agent-default")
+    assert params.tools is None
+    assert params.tool_choice is None
+
+
+def test_sampling_params_with_schema_carries_single_required_tool():
+    """_sampling_params builds the exact toolChoice-required shape."""
+    params = agent_server._sampling_params([], None, None, 10, "agent-default", _OUTPUT_SCHEMA)
+    assert params.tools is not None and len(params.tools) == 1
+    assert params.tools[0].name == "structured_output"
+    assert params.tools[0].input_schema == _OUTPUT_SCHEMA
+    assert params.tool_choice is not None and params.tool_choice.mode == "required"

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Fernando Garza" }]
-dependencies = ["mcp>=2,<3"]
+dependencies = ["mcp>=2,<3", "jsonschema>=4"]
 
 [project.scripts]
 agent-as-model = "agent_as_model.server:main"

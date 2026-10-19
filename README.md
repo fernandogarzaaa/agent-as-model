@@ -65,6 +65,16 @@ string or a list of text blocks.
 **list_models** — returns the one model this server offers: `agent-default`,
 an alias for the host agent's own model.
 
+**Structured output** — both completion tools accept an optional
+`output_schema` (a JSON Schema object with root type `object`). When given,
+the sampling request carries exactly one tool whose input schema is that
+schema, marked as the required tool choice: the host must answer by invoking
+the tool, so its tool-use input is the structured completion. The server
+validates that input against the schema and returns it as JSON text. A host
+answer that violates the schema fails loudly; bad output is never returned
+silently. The schema itself is validated up front, so a malformed schema is
+the caller's error, not a mid-flow surprise.
+
 ## How it works
 
 1. A product (or agent) calls `chat_complete` with ordinary chat messages.
@@ -98,7 +108,8 @@ an alias for the host agent's own model.
 
 - Provider-key fallback for hosts without sampling (opt-in, per-call choice
   stays with the user).
-- Structured output passthrough where hosts support it.
+- Structured output via the toolChoice-required trick (shipped: `output_schema`
+  on both completion tools, server-side validation with the `jsonschema` package).
 - More product shapes as tools (embeddings-shaped requests cannot be
   sampled meaningfully; out of scope by design).
 
@@ -109,6 +120,8 @@ python3 -m pytest tests/ -q
 python3 -m ruff format . && python3 -m ruff check .
 ```
 
-14 tests, all green: message translation unit tests plus end-to-end runs of
+38 tests, all green: message translation unit tests plus end-to-end runs of
 the full MCP loop (tool call to sampled completion) against a scripted host
-on both the modern multi-round-trip era and the legacy direct-sampling era.
+on both the modern multi-round-trip era and the legacy direct-sampling era,
+including the structured-output paths (single required tool in the sampling
+params and MRTR payload, validation success, and loud validation failure).
