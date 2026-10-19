@@ -68,7 +68,8 @@ prompt is sent as a single user sampling message with no system prompt and no
 role translation. `model`, `temperature`, and `max_tokens` behave exactly as
 on the other tools; there are no `tools`, `output_schema`, or `tool_choice`
 parameters, because those are chat-tool features and generate is zero
-overhead.
+overhead. It does accept the optional `persona` contract, which is
+request/response validation only and adds no sampling overhead.
 
 **list_models** — returns the one model this server offers: `agent-default`,
 an alias for the host agent's own model.
@@ -98,6 +99,27 @@ answers by calling tools, the tool returns JSON text in this stable shape
 A plain-text host answer returns text as before. Passing both `tools` and
 `output_schema` is an error: `output_schema` is already implemented as one
 required tool, so combining them is contradictory.
+
+**Personas** — all three completion tools (`chat_complete`,
+`messages_create`, and `generate`) accept an optional `persona`
+(`{name, input_schema, output_schema}`). The server is stateless: there is
+no persona registry, the host supplies the persona per call, and the same
+validation runs on both protocol eras. Before anything is sent, the persona
+itself is validated (`name` required and non-empty; `input_schema` and
+`output_schema`, when given, must be valid JSON Schema objects with root
+type `object`), and the tool's request arguments are validated against
+`input_schema` when given. The validated request object is the tool's
+parameter set with defaults applied, minus `persona` itself: `messages`,
+`model`, `temperature`, `max_tokens`, `output_schema`, `tools`,
+`tool_choice` for `chat_complete` (plus `system` for `messages_create`), and
+`prompt`, `model`, `temperature`, `max_tokens` for `generate`. After the
+host answers, the completion text must parse as JSON validating against
+`output_schema` when given; invalid output fails loudly, naming the
+persona. Unlike `output_schema`, a persona's `output_schema` does not change
+the sampling request (no required tool is injected): the host answers in
+plain text and the server parses it. Passing both `output_schema` and
+`persona.output_schema` is an error: the two are contradictory sources of
+the structured-output contract.
 
 ## How it works
 
@@ -149,7 +171,7 @@ python3 -m pytest tests/ -q
 python3 -m ruff format . && python3 -m ruff check .
 ```
 
-58 tests, all green: message translation unit tests plus end-to-end runs of
+74 tests, all green: message translation unit tests plus end-to-end runs of
 the full MCP loop (tool call to sampled completion) against a scripted host
 on both the modern multi-round-trip era and the legacy direct-sampling era,
 including the structured-output paths (single required tool in the sampling
@@ -157,5 +179,10 @@ params and MRTR payload, validation success, and loud validation failure),
 the tool-use passthrough paths (tools and tool_choice forwarded on both
 eras, capability-absent degradation to plain text with an explicit logged
 warning, documented JSON result shape, and the tools/output_schema conflict),
-and the generate tool (single user message with no system prompt and no
-tools on both eras, param pass-through, tool listing, description).
+the generate tool (single user message with no system prompt and no
+tools on both eras, param pass-through, tool listing, description), and the
+persona paths (persona advertised on all three completion tools,
+request-side validation success and rejection-before-sending, response-side
+validation success and loud failure, malformed-persona rejection, the
+output_schema/persona.output_schema conflict, identical behavior on both
+eras).

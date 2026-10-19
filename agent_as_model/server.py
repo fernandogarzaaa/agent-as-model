@@ -29,6 +29,17 @@ plain-text answer still returns text as before. `tools` and `output_schema`
 cannot be combined: output_schema is the single-required-tool convenience
 for structured output, and combining them raises a clear error naming both.
 
+Personas (item 10): every completion tool also accepts an optional `persona`
+`{"name", "input_schema", "output_schema"}`. The server is stateless: there is
+no persona registry, the host supplies the persona per call, and the server
+validates around `_complete`, identically on both eras. Before anything is
+sent, the persona itself is validated (non-empty name, valid object schemas)
+and the tool's request arguments are validated against `input_schema` when
+given. After the host answers, the completion text must parse as JSON
+validating against `output_schema` when given, reusing the item-3 machinery.
+`persona` rides `generate` too: it is request/response validation only, never
+a sampling feature, so generate stays the zero-overhead thin path.
+
 Era handling is explicit. The tool body reads the negotiated protocol
 version from the request Context and dispatches:
 
@@ -132,6 +143,23 @@ class ToolDefinition(BaseModel):
     name: str
     description: str | None = None
     input_schema: dict
+
+
+class Persona(BaseModel):
+    """A host-registered persona contract for one completion call.
+
+    The server is stateless: it keeps no persona registry. The host supplies
+    the persona per call as a plain dict, and the server validates the call
+    against it. `input_schema` constrains the tool's request arguments (see
+    `_validate_persona_request` for the exact per-tool shape); `output_schema`
+    constrains the host's completion text, which must parse as JSON validating
+    against it. Both schemas follow the same shape as `output_schema`: a JSON
+    Schema object with root type "object".
+    """
+
+    name: str
+    input_schema: dict | None = None
+    output_schema: dict | None = None
 
 
 def _is_modern_era(protocol_version: str | None) -> bool:
@@ -238,6 +266,113 @@ def _check_output_schema_tools_conflict(
             "single-required-tool convenience for structured output; pass tools "
             "or output_schema, not both"
         )
+
+
+def _check_output_schema_persona_conflict(
+    output_schema: dict | None, persona: Persona | None
+) -> None:
+    """`output_schema` and `persona.output_schema` are contradictory sources of
+    the structured-output contract: output_schema additionally drives the
+    toolChoice-required request mechanism, so combining them leaves the
+    constraint ambiguous. Fail loud naming both, like the tools/output_schema
+    conflict."""
+    if output_schema is not None and persona is not None and persona.output_schema is not None:
+        raise ToolError(
+            "output_schema and persona.output_schema cannot be combined: both declare "
+            "the structured-output contract, and output_schema is the "
+            "single-required-tool convenience that also changes the sampling "
+            "request; pass output_schema or persona.output_schema, not both"
+        )
+
+
+def _validate_persona(persona: Persona | None) -> Persona | None:
+    """Validate the host-supplied persona before anything travels.
+
+    name is required and non-empty; when given, input_schema and
+    output_schema must each be a valid JSON Schema object with root type
+    "object" (the same gate as output_schema). A malformed persona is the
+    caller's bug: fail here, loudly, not mid-flow.
+    """
+    if persona is None:
+        return None
+    if not persona.name.strip():
+        raise ToolError("persona.name is required and must be a non-empty string")
+    if persona.input_schema is not None:
+        _require_object_schema(persona.input_schema, param_name="persona.input_schema")
+    if persona.output_schema is not None:
+        _require_object_schema(persona.output_schema, param_name="persona.output_schema")
+    return persona
+
+
+def _validation_location(exc: jsonschema.ValidationError) -> str:
+    """JSON-pointer-style location of a schema violation, for loud errors."""
+    return (
+        "/" + "/".join(str(part) for part in exc.absolute_path) if exc.absolute_path else "(root)"
+    )
+
+
+def _validate_persona_request(persona: Persona | None, request_arguments: dict) -> None:
+    """Request-side persona gate: the tool's request arguments must satisfy the
+    persona's input_schema.
+
+    The validated object is exactly the tool's parameter set with server
+    defaults applied, minus the persona itself:
+    - chat_complete: {"messages", "model", "temperature", "max_tokens",
+      "output_schema", "tools", "tool_choice"}
+    - messages_create: the same plus "system"
+    - generate: {"prompt", "model", "temperature", "max_tokens"}
+    `messages` are the parsed message dicts (role/content), `prompt` the raw
+    string. Runs before anything is sent; a violation is the caller's bug and
+    fails loud here.
+    """
+    if persona is None or persona.input_schema is None:
+        return
+    try:
+        jsonschema.validate(instance=request_arguments, schema=persona.input_schema)
+    except jsonschema.ValidationError as exc:
+        raise ToolError(
+            f"persona {persona.name!r}: request failed input-schema validation at "
+            f"{_validation_location(exc)}: {exc.message}; the request was rejected "
+            "before anything was sent"
+        ) from exc
+
+
+def _validate_persona_output(persona: Persona | None, completion: str) -> str:
+    """Response-side persona gate: when the persona declares an output_schema,
+    the host's completion text must parse as JSON validating against it.
+
+    Reuses the item-3 machinery (`_validate_structured_output`); the error
+    names the persona so the host knows which contract rejected the output.
+    """
+    if persona is None or persona.output_schema is None:
+        return completion
+    try:
+        output = json.loads(completion)
+    except json.JSONDecodeError as exc:
+        raise ToolError(
+            f"persona {persona.name!r} requires structured output, but the host's "
+            f"completion is not valid JSON ({exc.msg}); the completion was rejected "
+            "rather than returned as-is"
+        ) from exc
+    _validate_structured_output(
+        output, persona.output_schema, source=f"persona {persona.name!r} output-schema"
+    )
+    return completion
+
+
+def _finish_persona(
+    persona: Persona | None, result: str | InputRequiredResult
+) -> str | InputRequiredResult:
+    """Response-side persona gate applied around `_complete`, so both eras share it.
+
+    The MRTR first round returns an InputRequiredResult (no completion yet):
+    it passes through untouched, and the gate runs on the retry round when the
+    host's completion arrives as text. The host re-supplies the persona on
+    every round: the server is stateless.
+    """
+    if isinstance(result, InputRequiredResult):
+        return result
+    return _validate_persona_output(persona, result)
 
 
 def _sampling_tools_supported(ctx: Context) -> bool:
@@ -413,23 +548,21 @@ def _extract_structured_output(result: CreateMessageResultWithTools) -> dict:
     return uses[0].input
 
 
-def _validate_structured_output(output: dict, output_schema: dict) -> None:
+def _validate_structured_output(
+    output: dict, output_schema: dict, *, source: str = "output-schema"
+) -> None:
     """Gate: the host's structured completion must satisfy the caller's schema.
 
     Raises ToolError naming the exact mismatch. Bad output is never returned
-    silently, and the schema is never dropped.
+    silently, and the schema is never dropped. `source` names the schema's
+    origin in the error: the output_schema parameter, or a persona's.
     """
     try:
         jsonschema.validate(instance=output, schema=output_schema)
     except jsonschema.ValidationError as exc:
-        location = (
-            "/" + "/".join(str(part) for part in exc.absolute_path)
-            if exc.absolute_path
-            else "(root)"
-        )
         raise ToolError(
-            f"Host completion failed output-schema validation at {location}: {exc.message}; "
-            "the completion was rejected rather than returned as-is"
+            f"Host completion failed {source} validation at {_validation_location(exc)}: "
+            f"{exc.message}; the completion was rejected rather than returned as-is"
         ) from exc
 
 
@@ -531,6 +664,12 @@ async def _complete(
         '{"text": "...", "tool_calls": [{"id": "...", "input": {...}, "name": "..."}]} '
         "(keys sorted). A plain-text host answer returns text as before. "
         "tools and output_schema cannot be combined. "
+        "An optional persona {name, input_schema, output_schema} registers a "
+        "per-call contract: the request arguments are validated against "
+        "input_schema before anything is sent, and the host's completion text "
+        "must parse as JSON validating against output_schema. The server is "
+        "stateless and keeps no persona registry. persona.output_schema and "
+        "output_schema cannot be combined. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -578,10 +717,40 @@ async def chat_complete(
             )
         ),
     ] = None,
+    persona: Annotated[
+        Persona | None,
+        Field(
+            description=(
+                "Optional persona contract for this call: {name, input_schema, "
+                "output_schema}. name is required and non-empty; the server is "
+                "stateless and keeps no persona registry. When input_schema is "
+                "given, the request arguments (messages, model, temperature, "
+                "max_tokens, output_schema, tools, tool_choice) are validated "
+                "against it before anything is sent. When output_schema is "
+                "given, the host's completion text must parse as JSON "
+                "validating against it. persona.output_schema and output_schema "
+                "cannot be combined."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a chat with the host agent's model (OpenAI request shape)."""
+    persona = _validate_persona(persona)
+    _check_output_schema_persona_conflict(output_schema, persona)
     validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = openai_to_sampling(messages)
+    _validate_persona_request(
+        persona,
+        {
+            "messages": [message.model_dump() for message in messages],
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "output_schema": output_schema,
+            "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
+            "tool_choice": tool_choice,
+        },
+    )
     params = _sampling_params(
         sampling_messages,
         system_prompt,
@@ -592,7 +761,9 @@ async def chat_complete(
         tools=validated_tools,
         tool_choice=tool_choice,
     )
-    return await _complete(ctx, params, output_schema, tools=validated_tools)
+    return _finish_persona(
+        persona, await _complete(ctx, params, output_schema, tools=validated_tools)
+    )
 
 
 @mcp.tool(
@@ -612,6 +783,12 @@ async def chat_complete(
         '{"text": "...", "tool_calls": [{"id": "...", "input": {...}, "name": "..."}]} '
         "(keys sorted). A plain-text host answer returns text as before. "
         "tools and output_schema cannot be combined. "
+        "An optional persona {name, input_schema, output_schema} registers a "
+        "per-call contract: the request arguments are validated against "
+        "input_schema before anything is sent, and the host's completion text "
+        "must parse as JSON validating against output_schema. The server is "
+        "stateless and keeps no persona registry. persona.output_schema and "
+        "output_schema cannot be combined. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -662,10 +839,43 @@ async def messages_create(
             )
         ),
     ] = None,
+    persona: Annotated[
+        Persona | None,
+        Field(
+            description=(
+                "Optional persona contract for this call: {name, input_schema, "
+                "output_schema}. name is required and non-empty; the server is "
+                "stateless and keeps no persona registry. When input_schema is "
+                "given, the request arguments (messages, model, system, "
+                "temperature, max_tokens, output_schema, tools, tool_choice) "
+                "are validated against it before anything is sent. When "
+                "output_schema is given, the host's completion text must parse "
+                "as JSON validating against it. persona.output_schema and "
+                "output_schema cannot be combined."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a conversation with the host agent's model (Anthropic request shape)."""
+    persona = _validate_persona(persona)
+    _check_output_schema_persona_conflict(output_schema, persona)
     validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = anthropic_to_sampling(messages, system)
+    _validate_persona_request(
+        persona,
+        {
+            "messages": [message.model_dump() for message in messages],
+            "model": model,
+            "system": [block.model_dump() for block in system]
+            if isinstance(system, list)
+            else system,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "output_schema": output_schema,
+            "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
+            "tool_choice": tool_choice,
+        },
+    )
     params = _sampling_params(
         sampling_messages,
         system_prompt,
@@ -676,7 +886,9 @@ async def messages_create(
         tools=validated_tools,
         tool_choice=tool_choice,
     )
-    return await _complete(ctx, params, output_schema, tools=validated_tools)
+    return _finish_persona(
+        persona, await _complete(ctx, params, output_schema, tools=validated_tools)
+    )
 
 
 @mcp.tool(
@@ -686,7 +898,10 @@ async def messages_create(
         "and no chat formatting: raw prompt in, completion text out, produced by "
         "the host agent's own model. Same model hint and parameters as the other "
         "completion tools, minus any chat or tool features: no tools, no "
-        "output_schema, no tool_choice. "
+        "output_schema, no tool_choice. It does accept the optional persona "
+        "contract ({name, input_schema, output_schema}): request/response "
+        "validation only, never a sampling feature, so the thin path stays "
+        "zero overhead. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -702,8 +917,32 @@ async def generate(
         float | None, Field(description="Sampling temperature, if the host honors it.")
     ] = None,
     max_tokens: Annotated[int, Field(description="Maximum tokens to generate.")] = 4096,
+    persona: Annotated[
+        Persona | None,
+        Field(
+            description=(
+                "Optional persona contract for this call: {name, input_schema, "
+                "output_schema}. name is required and non-empty; the server is "
+                "stateless and keeps no persona registry. When input_schema is "
+                "given, the request arguments (prompt, model, temperature, "
+                "max_tokens) are validated against it before anything is sent. "
+                "When output_schema is given, the host's completion text must "
+                "parse as JSON validating against it."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Generate a completion from a raw prompt with the host agent's model."""
+    persona = _validate_persona(persona)
+    _validate_persona_request(
+        persona,
+        {
+            "prompt": prompt,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+    )
     params = _sampling_params(
         [SamplingMessage(role="user", content=TextContent(type="text", text=prompt))],
         None,
@@ -711,7 +950,7 @@ async def generate(
         max_tokens,
         model,
     )
-    return await _complete(ctx, params)
+    return _finish_persona(persona, await _complete(ctx, params))
 
 
 @mcp.tool(

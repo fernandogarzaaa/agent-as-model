@@ -1060,8 +1060,10 @@ def test_sampling_params_with_tools():
 
 def test_generate_listed_with_others():
     """generate is listed alongside the other tools; the ctx param stays
-    hidden; the schema exposes only prompt/model/temperature/max_tokens:
-    no chat-tool surface (tools, output_schema, tool_choice)."""
+    hidden; the schema exposes prompt/model/temperature/max_tokens plus the
+    persona contract: no chat-tool surface (tools, output_schema,
+    tool_choice), since persona is validation-only, never a sampling
+    feature."""
 
     async def go():
         async with Client(SERVER) as client:
@@ -1072,6 +1074,7 @@ def test_generate_listed_with_others():
             props = tool.input_schema.get("properties", {})
             assert "ctx" not in props
             assert "prompt" in props
+            assert "persona" in props
             assert "tools" not in props
             assert "output_schema" not in props
             assert "tool_choice" not in props
@@ -1163,5 +1166,470 @@ def test_generate_description_states_raw_in_text_out():
             assert "raw" in description
             assert "no chat formatting" in description
             assert "host agent's own model" in description
+
+    _run(go)
+
+
+# ---------------------------------------------------------------------------
+# Item 10: typed per-tool schemas for host-registered personas
+# ---------------------------------------------------------------------------
+
+_PERSONA_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "messages": {"type": "array", "minItems": 1},
+        "max_tokens": {"type": "integer", "minimum": 1},
+    },
+    "required": ["messages"],
+}
+
+
+def _json_text_sampler_factory(text):
+    """Stand in for a host answering in plain text: the completion is raw text,
+    which persona.output_schema validation parses as JSON."""
+
+    async def sampler(context, params):
+        return types.CreateMessageResult(
+            role="assistant",
+            content=types.TextContent(type="text", text=text),
+            model="test-host-model",
+            stop_reason="endTurn",
+        )
+
+    return sampler
+
+
+def test_persona_exposed_in_tool_schemas():
+    """All three completion tools advertise persona; the Persona shape carries
+    name/input_schema/output_schema; the ctx param stays hidden."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            for name in ("chat_complete", "messages_create", "generate"):
+                tool = next(t for t in tools.tools if t.name == name)
+                props = tool.input_schema.get("properties", {})
+                assert "persona" in props
+                assert "ctx" not in props
+            persona_def = None
+            for tool in tools.tools:
+                persona_def = tool.input_schema.get("$defs", {}).get("Persona")
+                if persona_def is not None:
+                    break
+            assert persona_def is not None
+            assert {"name", "input_schema", "output_schema"} <= set(
+                persona_def.get("properties", {})
+            )
+            assert "name" in persona_def.get("required", [])
+
+    _run(go)
+
+
+def test_persona_request_validation_success_both_eras():
+    """Request-side gate, both eras: a persona whose input_schema the request
+    satisfies lets the call through; the completion comes back untouched."""
+
+    async def go():
+        persona = {"name": "terse", "input_schema": _PERSONA_INPUT_SCHEMA}
+        # Legacy era.
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "chat_complete",
+                {"messages": [{"role": "user", "content": "Hi"}], "persona": persona},
+            )
+            assert not result.is_error
+            assert _tool_text(result).startswith("CANNED:")
+        # Modern era, full MRTR loop.
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "messages_create",
+                {"messages": [{"role": "user", "content": "Hi"}], "persona": persona},
+            )
+            assert not result.is_error
+            assert _tool_text(result).startswith("CANNED:")
+
+    _run(go)
+
+
+def test_persona_request_validation_failure_rejects_before_sending():
+    """Request-side gate: a request violating the persona's input_schema fails
+    loud, naming the persona, and nothing is sent to the host. Both eras."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        persona = {"name": "pairwise", "input_schema": _PERSONA_INPUT_SCHEMA}
+        args = {
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 0,  # violates minimum: 1
+            "persona": persona,
+        }
+        # Legacy era.
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            result = await client.call_tool("chat_complete", args)
+            assert result.is_error
+            text = _tool_text(result)
+            assert "pairwise" in text
+            assert "input-schema validation" in text
+            assert "before anything was sent" in text
+        # Modern era: the tool raises before returning an InputRequiredResult.
+        async with Client(SERVER, sampling_callback=recording_sampler) as client:
+            result = await client.call_tool("chat_complete", args)
+            assert result.is_error
+            assert "pairwise" in _tool_text(result)
+        # The host was never asked: validation runs before anything is sent.
+        assert calls == []
+
+    _run(go)
+
+
+def test_persona_request_validation_generate():
+    """generate takes persona too: the input_schema constrains the prompt, and
+    a violating prompt is rejected before anything is sent."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        schema = {
+            "type": "object",
+            "properties": {"prompt": {"type": "string", "minLength": 5}},
+            "required": ["prompt"],
+        }
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            ok = await client.call_tool(
+                "generate",
+                {
+                    "prompt": "Say the word hello.",
+                    "persona": {"name": "haiku", "input_schema": schema},
+                },
+            )
+            assert not ok.is_error
+            assert _tool_text(ok).startswith("CANNED:")
+
+            bad = await client.call_tool(
+                "generate",
+                {"prompt": "Hi", "persona": {"name": "haiku", "input_schema": schema}},
+            )
+            assert bad.is_error
+            text = _tool_text(bad)
+            assert "haiku" in text
+            assert "input-schema validation" in text
+        # Exactly one host call: the rejected prompt never traveled.
+        assert len(calls) == 1
+
+    _run(go)
+
+
+def test_persona_request_validation_failure_messages_create():
+    """messages_create's request-side gate: a request violating the persona's
+    input_schema fails loud before anything is sent."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        schema = {
+            "type": "object",
+            "properties": {"system": {"type": "string", "minLength": 1}},
+        }
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            result = await client.call_tool(
+                "messages_create",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "persona": {"name": "sysonly", "input_schema": schema},
+                },
+            )
+            assert result.is_error
+            text = _tool_text(result)
+            assert "sysonly" in text
+            assert "input-schema validation" in text
+            assert "/system" in text
+        assert calls == []
+
+    _run(go)
+
+
+def test_persona_output_validation_success_legacy():
+    """Response-side gate: a host completion that parses as JSON validating
+    against persona.output_schema is returned as-is."""
+
+    async def go():
+        sampler = _json_text_sampler_factory('{"answer": "yes", "confidence": 0.9}')
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+            )
+            assert not result.is_error
+            assert _tool_text(result) == '{"answer": "yes", "confidence": 0.9}'
+
+    _run(go)
+
+
+def test_persona_output_validation_success_modern_full_loop():
+    """Response-side gate, modern era full MRTR loop: valid JSON completion
+    returns as-is."""
+
+    async def go():
+        sampler = _json_text_sampler_factory('{"answer": "structured hi"}')
+        async with Client(SERVER, sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "messages_create",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+            )
+            assert not result.is_error
+            assert _tool_text(result) == '{"answer": "structured hi"}'
+
+    _run(go)
+
+
+def test_persona_output_validation_failure():
+    """Response-side gate: non-JSON text and schema-violating JSON both fail
+    loud, naming the persona. Legacy and modern eras."""
+
+    async def go():
+        persona = {"name": "answerer", "output_schema": _OUTPUT_SCHEMA}
+        args = {"messages": [{"role": "user", "content": "Hi"}], "persona": persona}
+        # Legacy era: prose is not valid JSON for the persona.
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=_json_text_sampler_factory("just prose, no json"),
+        ) as client:
+            result = await client.call_tool("chat_complete", args)
+            assert result.is_error
+            text = _tool_text(result)
+            assert "answerer" in text
+            assert "not valid JSON" in text
+        # Legacy era: JSON violating the schema names the mismatch.
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=_json_text_sampler_factory('{"answer": 42}'),
+        ) as client:
+            result = await client.call_tool("chat_complete", args)
+            assert result.is_error
+            text = _tool_text(result)
+            assert "answerer" in text
+            assert "output-schema validation" in text
+            assert "/answer" in text
+        # Modern era, full MRTR loop: schema violation fails the same way.
+        async with Client(
+            SERVER, sampling_callback=_json_text_sampler_factory('{"answer": 42}')
+        ) as client:
+            result = await client.call_tool("messages_create", args)
+            assert result.is_error
+            text = _tool_text(result)
+            assert "answerer" in text
+            assert "output-schema validation" in text
+
+    _run(go)
+
+
+def test_persona_modern_era_round_one_defers_response_validation():
+    """Modern era, round one: a persona.output_schema does NOT inject a
+    required tool (unlike output_schema); the host answers in plain text and
+    the response-side gate runs on the retry round."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            first = await client.session.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert params.tools is None
+            assert params.tool_choice is None
+            assert first.request_state
+
+    _run(go)
+
+
+def test_output_schema_and_persona_output_schema_conflict():
+    """output_schema and persona.output_schema together fail loud, naming
+    both. Both chat tools, before anything is sent."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            for tool_name, args in (
+                ("chat_complete", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("messages_create", {"messages": [{"role": "user", "content": "Hi"}]}),
+            ):
+                result = await client.call_tool(
+                    tool_name,
+                    {
+                        **args,
+                        "output_schema": _OUTPUT_SCHEMA,
+                        "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                    },
+                )
+                assert result.is_error
+                text = _tool_text(result)
+                assert "output_schema" in text
+                assert "persona.output_schema" in text
+        assert calls == []
+
+    _run(go)
+
+
+def test_malformed_persona_rejected_e2e():
+    """End to end: an empty or blank persona name fails loud before the host
+    is involved."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            for bad_name in ("", "   "):
+                result = await client.call_tool(
+                    "chat_complete",
+                    {
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "persona": {"name": bad_name},
+                    },
+                )
+                assert result.is_error
+                assert "persona.name" in _tool_text(result)
+
+    _run(go)
+
+
+def test_validate_persona():
+    """Unit: None passes through; empty/blank names and bad schemas fail loud
+    with the offending field named."""
+    assert agent_server._validate_persona(None) is None
+    persona = agent_server._validate_persona(agent_server.Persona(name="terse"))
+    assert persona is not None and persona.name == "terse"
+    assert persona.input_schema is None and persona.output_schema is None
+
+    with pytest.raises(ToolError, match="persona.name.*non-empty string"):
+        agent_server._validate_persona(agent_server.Persona(name=""))
+    with pytest.raises(ToolError, match="persona.name.*non-empty string"):
+        agent_server._validate_persona(agent_server.Persona(name="   "))
+    with pytest.raises(ToolError, match=r"persona\.input_schema.*root type 'object'"):
+        agent_server._validate_persona(
+            agent_server.Persona(name="x", input_schema={"type": "array"})
+        )
+    with pytest.raises(ToolError, match=r"persona\.output_schema.*not a valid JSON Schema"):
+        agent_server._validate_persona(
+            agent_server.Persona(
+                name="x",
+                output_schema={"type": "object", "properties": {"a": {"type": "bogus"}}},
+            )
+        )
+    assert (
+        agent_server._validate_persona(
+            agent_server.Persona(
+                name="x",
+                input_schema=_PERSONA_INPUT_SCHEMA,
+                output_schema=_OUTPUT_SCHEMA,
+            )
+        )
+        is not None
+    )
+
+
+def test_check_output_schema_persona_conflict_unit():
+    """Unit: the conflict fires only when both schema sources are present."""
+    persona = agent_server.Persona(name="x", output_schema=_OUTPUT_SCHEMA)
+    bare = agent_server.Persona(name="x")
+    agent_server._check_output_schema_persona_conflict(None, persona)
+    agent_server._check_output_schema_persona_conflict(_OUTPUT_SCHEMA, None)
+    agent_server._check_output_schema_persona_conflict(_OUTPUT_SCHEMA, bare)
+    with pytest.raises(ToolError, match="persona.output_schema"):
+        agent_server._check_output_schema_persona_conflict(_OUTPUT_SCHEMA, persona)
+    assert "output_schema" in str(
+        pytest.raises(
+            ToolError, agent_server._check_output_schema_persona_conflict, _OUTPUT_SCHEMA, persona
+        ).value
+    )
+
+
+def test_validate_persona_request_unit():
+    """Unit: the request gate no-ops without a persona or input_schema, and
+    reports the exact location of a violation."""
+    agent_server._validate_persona_request(None, {"messages": []})
+    agent_server._validate_persona_request(agent_server.Persona(name="x"), {"messages": []})
+    agent_server._validate_persona_request(
+        agent_server.Persona(name="terse", input_schema=_PERSONA_INPUT_SCHEMA),
+        {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 10},
+    )
+    with pytest.raises(ToolError, match=r"persona 'terse'.*input-schema validation.*\(root\)"):
+        agent_server._validate_persona_request(
+            agent_server.Persona(name="terse", input_schema=_PERSONA_INPUT_SCHEMA),
+            {"max_tokens": 10},  # "messages" is required
+        )
+
+
+def test_validate_persona_output_unit():
+    """Unit: no-op without a persona or output_schema; non-JSON and
+    schema-violating completions fail loud."""
+    persona = agent_server.Persona(name="answerer", output_schema=_OUTPUT_SCHEMA)
+    assert agent_server._validate_persona_output(None, "anything") == "anything"
+    assert (
+        agent_server._validate_persona_output(agent_server.Persona(name="x"), "anything")
+        == "anything"
+    )
+    assert agent_server._validate_persona_output(persona, '{"answer": "ok"}') == '{"answer": "ok"}'
+    with pytest.raises(ToolError, match="not valid JSON"):
+        agent_server._validate_persona_output(persona, "not json at all")
+    with pytest.raises(ToolError, match=r"persona 'answerer'.*output-schema validation"):
+        agent_server._validate_persona_output(persona, '{"answer": 42}')
+
+
+def test_finish_persona():
+    """Unit: the MRTR first round passes through untouched; otherwise the
+    response-side gate runs."""
+    params = agent_server._sampling_params([], None, None, 10, "agent-default")
+    first_round = agent_server._mrtr_completion_request(params)
+    persona = agent_server.Persona(name="answerer", output_schema=_OUTPUT_SCHEMA)
+    assert agent_server._finish_persona(persona, first_round) is first_round
+    assert agent_server._finish_persona(None, "plain") == "plain"
+    assert agent_server._finish_persona(persona, '{"answer": "ok"}') == '{"answer": "ok"}'
+    with pytest.raises(ToolError, match="not valid JSON"):
+        agent_server._finish_persona(persona, "plain")
+
+
+def test_generate_lists_persona():
+    """generate's schema exposes persona alongside the thin-path params."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            tool = next(t for t in tools.tools if t.name == "generate")
+            props = tool.input_schema.get("properties", {})
+            assert "persona" in props
+            assert "prompt" in props
+            # Still the thin path: no chat or tool features.
+            assert "tools" not in props
+            assert "output_schema" not in props
+            assert "tool_choice" not in props
 
     _run(go)

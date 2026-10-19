@@ -48,7 +48,8 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   message with no system prompt; `model`, `temperature`, and `max_tokens`
   behave exactly as on the chat tools. No `tools`, no `output_schema`, no
   `tool_choice`: those are chat-tool features, and generate stays zero
-  overhead by leaving them out.
+  overhead by leaving them out. It does take `persona`: validation-only,
+  never a sampling feature.
 - Capability failures are loud. A host without `sampling` gets
   `MISSING_REQUIRED_CLIENT_CAPABILITY`, never an empty completion.
 - Non-text sampling results raise instead of being stringified.
@@ -70,6 +71,28 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   rather than silently preferring one.
 - Caller-supplied tool definitions are validated up front (non-empty unique
   name, valid object input schema) and never reach the host malformed.
+- Personas are stateless per-call contracts: the host supplies `persona`
+  (`{name, input_schema, output_schema}`) on each completion call; the
+  server keeps no registry. `name` is required and non-empty, and both
+  schemas, when given, must be valid JSON Schema objects with root type
+  `object`, validated before anything is sent.
+- A persona's `input_schema` constrains the tool's request arguments (the
+  parameter set with defaults applied, minus `persona` itself: messages,
+  model, temperature, max_tokens, output_schema, tools, tool_choice on the
+  chat tools, plus system on messages_create; prompt, model, temperature,
+  max_tokens on generate). Its `output_schema` constrains the host's
+  completion text, which must parse as JSON validating against it, reusing
+  the output_schema validation machinery. Both gates sit around the era
+  dispatch, so the legacy and modern paths share them identically.
+- `persona.output_schema` and `output_schema` conflict by design, on the
+  same loud-failure precedent as `tools`/`output_schema`: both declare the
+  structured-output contract, and `output_schema` additionally changes the
+  request into the toolChoice-required shape. A persona's `output_schema`
+  never injects a required tool into the sampling request; the host answers
+  in plain text and the server parses it.
+- `generate` accepts `persona`: it is a completion tool on the same host
+  model, and persona is request/response validation only, never a sampling
+  feature, so the thin path stays zero overhead.
 
 ## Security
 
@@ -87,7 +110,11 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   assertions (system prompt, messages, temperature, max tokens, model
   hints), `messages_create`, `list_models`, the no-sampling error path, and
   `generate` (prompt as a single user message with no system prompt on both
-  eras, params pass-through, tool listing, description).
+  eras, params pass-through, tool listing, description), and the persona
+  paths (advertised on all three completion tools, request-side validation
+  success and rejection-before-sending, response-side validation success and
+  loud failure, malformed-persona rejection, the
+  output_schema/persona.output_schema conflict, identical on both eras).
 - `ruff format` and `ruff check` clean.
 - Standing implementation gate: testteeth mutation run on touched code
   (see commit log for the score).
