@@ -75,6 +75,22 @@ answer that violates the schema fails loudly; bad output is never returned
 silently. The schema itself is validated up front, so a malformed schema is
 the caller's error, not a mid-flow surprise.
 
+**Tool-use passthrough** — both completion tools also accept `tools`, a list
+of tool definitions (`{name, description, input_schema}` with `input_schema`
+a JSON Schema object with root type `object`), and `tool_choice`
+(`auto`/`required`/`none`, default `auto`). The definitions are validated up
+front (non-empty unique names, valid object schemas) and forwarded to the
+host's model in the sampling request on both protocol eras. Forwarding is
+fenced by the host's `sampling.tools` capability: a host that does not
+advertise it gets a tool-free request instead, the degradation is logged
+server-side as a warning, and the call returns plain text. When the host
+answers by calling tools, the tool returns JSON text in this stable shape
+(keys sorted):
+`{"text": "...", "tool_calls": [{"id": "...", "input": {...}, "name": "..."}]}`.
+A plain-text host answer returns text as before. Passing both `tools` and
+`output_schema` is an error: `output_schema` is already implemented as one
+required tool, so combining them is contradictory.
+
 ## How it works
 
 1. A product (or agent) calls `chat_complete` with ordinary chat messages.
@@ -101,8 +117,10 @@ the caller's error, not a mid-flow surprise.
   The 2026-07-28+ MRTR path needs no sampling capability at all.
 - Latency is one host model call per tool call. This is a thinking
   endpoint, not a fast one.
-- v1 serves text only. Tool calls, images, and audio in either direction
-  are rejected with explicit errors, not silently dropped.
+- Tool calls are passed through, never executed. The server forwards tool
+  definitions to the host's model and returns the host's tool calls as JSON;
+  it never runs them. Images and audio in either direction are still rejected
+  with explicit errors, not silently dropped.
 
 ## Roadmap
 
@@ -110,6 +128,9 @@ the caller's error, not a mid-flow surprise.
   stays with the user).
 - Structured output via the toolChoice-required trick (shipped: `output_schema`
   on both completion tools, server-side validation with the `jsonschema` package).
+- Tool-use passthrough (shipped: `tools`/`tool_choice` on both completion
+  tools, fenced by the host's `sampling.tools` capability with explicit
+  plain-text degradation, documented JSON result shape).
 - More product shapes as tools (embeddings-shaped requests cannot be
   sampled meaningfully; out of scope by design).
 
@@ -120,8 +141,11 @@ python3 -m pytest tests/ -q
 python3 -m ruff format . && python3 -m ruff check .
 ```
 
-38 tests, all green: message translation unit tests plus end-to-end runs of
+53 tests, all green: message translation unit tests plus end-to-end runs of
 the full MCP loop (tool call to sampled completion) against a scripted host
 on both the modern multi-round-trip era and the legacy direct-sampling era,
 including the structured-output paths (single required tool in the sampling
-params and MRTR payload, validation success, and loud validation failure).
+params and MRTR payload, validation success, and loud validation failure)
+and the tool-use passthrough paths (tools and tool_choice forwarded on both
+eras, capability-absent degradation to plain text with an explicit logged
+warning, documented JSON result shape, and the tools/output_schema conflict).

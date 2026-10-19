@@ -615,3 +615,439 @@ def test_sampling_params_with_schema_carries_single_required_tool():
     assert params.tools[0].name == "structured_output"
     assert params.tools[0].input_schema == _OUTPUT_SCHEMA
     assert params.tool_choice is not None and params.tool_choice.mode == "required"
+
+
+# ---------------------------------------------------------------------------
+# Item 4: function-calling / tool-use passthrough
+# ---------------------------------------------------------------------------
+
+_TOOL_DEFS = [
+    {
+        "name": "get_weather",
+        "description": "Get the weather for a city.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "search",
+        "description": "Search the web.",
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+    },
+]
+
+_TOOLS_CAPABILITY = types.SamplingCapability(tools=types.SamplingToolsCapability())
+_NO_TOOLS_CAPABILITY = types.SamplingCapability()
+_MINIMAL_TOOLS = [
+    types.Tool(name="t", input_schema={"type": "object"}),
+]
+
+
+def _tool_call_sampler_factory(tool_calls, text="", expected_choice="auto"):
+    """Stand in for a tools-capable host: assert the forwarded tools and
+    tool choice are in the sampling params, then answer with tool calls."""
+
+    async def sampler(context, params):
+        assert params.tools is not None
+        assert [t.name for t in params.tools] == ["get_weather", "search"]
+        assert params.tools[0].description == "Get the weather for a city."
+        assert params.tools[0].input_schema["properties"]["city"] == {"type": "string"}
+        assert params.tool_choice is not None
+        assert params.tool_choice.mode == expected_choice
+        content = [types.TextContent(type="text", text=text)] if text else []
+        for call in tool_calls:
+            content.append(
+                types.ToolUseContent(
+                    type="tool_use", name=call["name"], id=call["id"], input=call["input"]
+                )
+            )
+        return types.CreateMessageResultWithTools(
+            role="assistant",
+            content=content,
+            model="test-host-model",
+            stop_reason="toolUse",
+        )
+
+    return sampler
+
+
+async def _no_tools_sampler(context, params):
+    """Stand in for a host without tools support: the request must arrive
+    tool-free, and the answer is plain text."""
+    assert params.tools is None
+    assert params.tool_choice is None
+    return types.CreateMessageResult(
+        role="assistant",
+        content=types.TextContent(type="text", text="plain answer"),
+        model="test-host-model",
+        stop_reason="endTurn",
+    )
+
+
+def test_tools_and_tool_choice_exposed_in_tool_schemas():
+    """Both tools advertise tools and tool_choice; the ctx param stays hidden."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            for name in ("chat_complete", "messages_create"):
+                tool = next(t for t in tools.tools if t.name == name)
+                props = tool.input_schema.get("properties", {})
+                assert "tools" in props
+                assert "tool_choice" in props
+                assert "ctx" not in props
+                defs = tool.input_schema.get("$defs", {})
+                item_props = defs.get("ToolDefinition", {}).get("properties", {})
+                assert {"name", "description", "input_schema"} <= set(item_props)
+
+    _run(go)
+
+
+def test_tools_forwarded_legacy_params_and_result_shape():
+    """Legacy era: tools and the tool choice reach the sampling params, and the
+    host's tool calls come back in the documented JSON shape. Both tools."""
+
+    tool_calls = [
+        {"name": "get_weather", "id": "call-1", "input": {"city": "Naga"}},
+        {"name": "search", "id": "call-2", "input": {"query": "mcp sampling"}},
+    ]
+
+    async def go():
+        sampler = _tool_call_sampler_factory(tool_calls, text="thinking out loud")
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=sampler,
+            sampling_capabilities=_TOOLS_CAPABILITY,
+        ) as client:
+            for tool_name, args in (
+                ("chat_complete", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("messages_create", {"messages": [{"role": "user", "content": "Hi"}]}),
+            ):
+                result = await client.call_tool(
+                    tool_name, {**args, "tools": _TOOL_DEFS, "tool_choice": "auto"}
+                )
+                assert not result.is_error
+                payload = json.loads(_tool_text(result))
+                assert payload["text"] == "thinking out loud"
+                assert payload["tool_calls"] == [
+                    {"id": "call-1", "input": {"city": "Naga"}, "name": "get_weather"},
+                    {
+                        "id": "call-2",
+                        "input": {"query": "mcp sampling"},
+                        "name": "search",
+                    },
+                ]
+
+    _run(go)
+
+
+def test_tool_choice_forwarding():
+    """Legacy era: explicit 'required' and 'none' tool choices reach the host."""
+
+    async def go():
+        for choice in ("required", "none"):
+            sampler = _tool_call_sampler_factory([], text="just text", expected_choice=choice)
+            async with Client(
+                SERVER,
+                mode="legacy",
+                sampling_callback=sampler,
+                sampling_capabilities=_TOOLS_CAPABILITY,
+            ) as client:
+                result = await client.call_tool(
+                    "chat_complete",
+                    {
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "tools": _TOOL_DEFS,
+                        "tool_choice": choice,
+                    },
+                )
+                assert _tool_text(result) == "just text"
+
+    _run(go)
+
+
+def test_tools_modern_era_payload_carries_tools():
+    """Modern era, round one: the InputRequiredResult payload carries the
+    forwarded tools and the tool choice, defaulting to auto."""
+
+    async def go():
+        async with Client(
+            SERVER,
+            sampling_callback=_canned_sampler,
+            sampling_capabilities=_TOOLS_CAPABILITY,
+        ) as client:
+            first = await client.session.call_tool(
+                "chat_complete",
+                {"messages": [{"role": "user", "content": "Hi"}], "tools": _TOOL_DEFS},
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert [t.name for t in params.tools] == ["get_weather", "search"]
+            assert params.tool_choice.mode == "auto"
+
+            # request_state is sealed by the server kernel on the wire (opaque to
+            # the client by spec); its raw shape is pinned at the unit level below.
+            assert first.request_state
+
+    _run(go)
+
+
+def test_tools_modern_era_request_state_carries_tools():
+    """Unit level: the MRTR request_state JSON carries the forwarded tools and
+    the tool choice."""
+    tools = agent_server._validate_tool_definitions(
+        [agent_server.ToolDefinition(**d) for d in _TOOL_DEFS]
+    )
+    params = agent_server._sampling_params(
+        [types.SamplingMessage(role="user", content=types.TextContent(type="text", text="Hi"))],
+        None,
+        None,
+        100,
+        "agent-default",
+        tools=tools,
+        tool_choice="required",
+    )
+    result = agent_server._mrtr_completion_request(params)
+    state = json.loads(result.request_state)
+    assert [t["name"] for t in state["tools"]] == ["get_weather", "search"]
+    assert state["tools"][0]["inputSchema"]["properties"] == {"city": {"type": "string"}}
+    assert state["toolChoice"] == {"mode": "required"}
+
+
+def test_tools_modern_era_full_loop():
+    """Modern era, full MRTR loop: the host's tool calls return in the
+    documented JSON shape."""
+
+    tool_calls = [{"name": "get_weather", "id": "call-9", "input": {"city": "Manila"}}]
+
+    async def go():
+        sampler = _tool_call_sampler_factory(tool_calls)
+        async with Client(
+            SERVER,
+            sampling_callback=sampler,
+            sampling_capabilities=_TOOLS_CAPABILITY,
+        ) as client:
+            result = await client.call_tool(
+                "messages_create",
+                {"messages": [{"role": "user", "content": "Hi"}], "tools": _TOOL_DEFS},
+            )
+            payload = json.loads(_tool_text(result))
+            assert payload["tool_calls"] == [
+                {"id": "call-9", "input": {"city": "Manila"}, "name": "get_weather"}
+            ]
+            assert payload["text"] == ""
+
+    _run(go)
+
+
+def test_capability_absent_degrades_to_plain_text_legacy(caplog):
+    """Legacy era: a host without sampling.tools gets a tool-free request, the
+    degradation is logged explicitly, and the caller gets plain text."""
+
+    async def go():
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=_no_tools_sampler,
+            sampling_capabilities=_NO_TOOLS_CAPABILITY,
+        ) as client:
+            with caplog.at_level("WARNING", logger="agent_as_model"):
+                result = await client.call_tool(
+                    "chat_complete",
+                    {"messages": [{"role": "user", "content": "Hi"}], "tools": _TOOL_DEFS},
+                )
+            assert _tool_text(result) == "plain answer"
+
+    _run(go)
+    assert any("sampling.tools" in record.message for record in caplog.records)
+
+
+def test_capability_absent_degrades_to_plain_text_modern(caplog):
+    """Modern era, round one: without sampling.tools the MRTR payload carries
+    no tools, the degradation is logged, and the shape stays intact."""
+
+    async def go():
+        async with Client(
+            SERVER,
+            sampling_callback=_no_tools_sampler,
+            sampling_capabilities=_NO_TOOLS_CAPABILITY,
+        ) as client:
+            with caplog.at_level("WARNING", logger="agent_as_model"):
+                first = await client.session.call_tool(
+                    "chat_complete",
+                    {"messages": [{"role": "user", "content": "Hi"}], "tools": _TOOL_DEFS},
+                    allow_input_required=True,
+                )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert params.tools is None
+            assert params.tool_choice is None
+
+    _run(go)
+    assert any("sampling.tools" in record.message for record in caplog.records)
+
+
+def test_tools_and_output_schema_conflict():
+    """Providing both tools and output_schema fails loud, naming both. Both tools."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            for tool_name, args in (
+                ("chat_complete", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("messages_create", {"messages": [{"role": "user", "content": "Hi"}]}),
+            ):
+                result = await client.call_tool(
+                    tool_name,
+                    {**args, "tools": _TOOL_DEFS, "output_schema": _OUTPUT_SCHEMA},
+                )
+                assert result.is_error
+                text = _tool_text(result)
+                assert "tools" in text and "output_schema" in text
+
+    _run(go)
+
+
+def test_validate_tool_definitions():
+    """Malformed tool definitions are rejected with clear errors before
+    reaching the host; valid ones convert to MCP tools."""
+    good = agent_server._validate_tool_definitions(
+        [agent_server.ToolDefinition(**d) for d in _TOOL_DEFS]
+    )
+    assert [t.name for t in good] == ["get_weather", "search"]
+    assert good[0].input_schema == _TOOL_DEFS[0]["input_schema"]
+    assert agent_server._validate_tool_definitions(None) is None
+
+    def make(**overrides):
+        base = dict(_TOOL_DEFS[0])
+        base.update(overrides)
+        return agent_server.ToolDefinition(**base)
+
+    with pytest.raises(ToolError, match="non-empty string"):
+        agent_server._validate_tool_definitions([make(name="")])
+    with pytest.raises(ToolError, match="non-empty string"):
+        agent_server._validate_tool_definitions([make(name="   ")])
+    with pytest.raises(ToolError, match="duplicate tool name"):
+        agent_server._validate_tool_definitions([make(), make()])
+    with pytest.raises(ToolError, match=r"tools\[0\]\.input_schema.*root type 'object'"):
+        agent_server._validate_tool_definitions([make(input_schema={"type": "array"})])
+    with pytest.raises(ToolError, match="not a valid JSON Schema"):
+        agent_server._validate_tool_definitions(
+            [make(input_schema={"type": "object", "properties": {"x": {"type": "bogus"}}})]
+        )
+    with pytest.raises(ToolError, match="non-empty list"):
+        agent_server._validate_tool_definitions([])
+
+
+def test_format_tool_calls_shape():
+    """The passthrough shape: mixed text plus tool calls become sorted-key
+    JSON; a plain-text answer returns text; unknown blocks fail loud."""
+    mixed = types.CreateMessageResultWithTools(
+        role="assistant",
+        content=[
+            types.TextContent(type="text", text="here you go"),
+            types.ToolUseContent(type="tool_use", name="search", id="c-1", input={"query": "x"}),
+        ],
+        model="m",
+        stop_reason="toolUse",
+    )
+    # Keys are sorted for a deterministic wire shape (sort_keys=True); the raw
+    # string pins the order so a sort_keys flip is caught.
+    assert agent_server._format_tool_calls(mixed) == (
+        '{"text": "here you go", '
+        '"tool_calls": [{"id": "c-1", "input": {"query": "x"}, "name": "search"}]}'
+    )
+
+    text_only = types.CreateMessageResultWithTools(
+        role="assistant",
+        content=[types.TextContent(type="text", text="just words")],
+        model="m",
+        stop_reason="endTurn",
+    )
+    assert agent_server._format_tool_calls(text_only) == "just words"
+
+    weird = types.CreateMessageResultWithTools(
+        role="assistant",
+        content=[
+            types.ImageContent(
+                type="image",
+                data="AAAA",
+                mimeType="image/png",
+            )
+        ],
+        model="m",
+        stop_reason="endTurn",
+    )
+    with pytest.raises(ToolError, match="unsupported content block"):
+        agent_server._format_tool_calls(weird)
+
+
+def test_mrtr_completion_result_tool_calls():
+    """Modern round two with tools: tool calls return the JSON shape; a
+    plain-text host answer returns text as before."""
+    with_tools = SimpleNamespace(
+        input_responses={
+            "sample": types.CreateMessageResultWithTools(
+                role="assistant",
+                content=[
+                    types.ToolUseContent(
+                        type="tool_use", name="search", id="c-2", input={"query": "y"}
+                    )
+                ],
+                model="m",
+                stop_reason="toolUse",
+            )
+        }
+    )
+    payload = json.loads(agent_server._mrtr_completion_result(with_tools, tools=_MINIMAL_TOOLS))
+    assert payload["tool_calls"] == [{"id": "c-2", "input": {"query": "y"}, "name": "search"}]
+
+    plain = SimpleNamespace(
+        input_responses={
+            "sample": types.CreateMessageResult(
+                role="assistant",
+                content=types.TextContent(type="text", text="plain"),
+                model="m",
+                stop_reason="endTurn",
+            )
+        }
+    )
+    assert agent_server._mrtr_completion_result(plain, tools=_MINIMAL_TOOLS) == "plain"
+
+
+def test_sampling_tools_supported():
+    """The fence reads sampling.tools presence, never assuming support."""
+    assert agent_server._sampling_tools_supported(
+        SimpleNamespace(client_capabilities=types.ClientCapabilities(sampling=_TOOLS_CAPABILITY))
+    )
+    assert not agent_server._sampling_tools_supported(
+        SimpleNamespace(client_capabilities=types.ClientCapabilities(sampling=_NO_TOOLS_CAPABILITY))
+    )
+    assert not agent_server._sampling_tools_supported(
+        SimpleNamespace(client_capabilities=types.ClientCapabilities())
+    )
+    assert not agent_server._sampling_tools_supported(SimpleNamespace(client_capabilities=None))
+    assert not agent_server._sampling_tools_supported(SimpleNamespace())
+
+
+def test_sampling_params_with_tools():
+    """_sampling_params forwards validated tools with the chosen choice,
+    defaulting to auto; the default path stays tool-free."""
+    tools = agent_server._validate_tool_definitions(
+        [agent_server.ToolDefinition(**d) for d in _TOOL_DEFS]
+    )
+    params = agent_server._sampling_params([], None, None, 10, "agent-default", tools=tools)
+    assert [t.name for t in params.tools] == ["get_weather", "search"]
+    assert params.tool_choice.mode == "auto"
+
+    params = agent_server._sampling_params(
+        [], None, None, 10, "agent-default", tools=tools, tool_choice="none"
+    )
+    assert params.tool_choice.mode == "none"
+
+    bare = agent_server._sampling_params([], None, None, 10, "agent-default")
+    assert bare.tools is None
+    assert bare.tool_choice is None

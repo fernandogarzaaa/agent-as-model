@@ -43,6 +43,24 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
 - Capability failures are loud. A host without `sampling` gets
   `MISSING_REQUIRED_CLIENT_CAPABILITY`, never an empty completion.
 - Non-text sampling results raise instead of being stringified.
+- Tool-use passthrough: `tools`/`tool_choice` on both completion tools are
+  forwarded to the host's model (legacy sampling params and modern MRTR
+  payload alike), fenced by the host's `sampling.tools` capability. Without
+  it the tools are dropped before sending, the degradation is logged
+  server-side as a warning, and the call returns plain text: explicit, never
+  a silent half-state. The return shape stays a text completion; the caller
+  gets no in-band degradation flag, because adding one would corrupt the
+  shape for every caller. A plain-text answer to a tools request simply
+  returns text.
+- Host tool calls return as JSON text in the stable shape
+  `{"text": "...", "tool_calls": [{"name": ..., "id": ..., "input": ...}]}`
+  (keys sorted). The server never executes them.
+- `tools` and `output_schema` conflict by design: output_schema is already
+  implemented as exactly one required tool, so combining them leaves the
+  required-tool constraint ambiguous. The call fails loud naming both,
+  rather than silently preferring one.
+- Caller-supplied tool definitions are validated up front (non-empty unique
+  name, valid object input schema) and never reach the host malformed.
 
 ## Security
 

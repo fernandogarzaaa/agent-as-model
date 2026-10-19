@@ -16,6 +16,18 @@ trick): the host must answer by invoking the tool, and the server validates
 the tool-use input against the schema before returning it as JSON text.
 Invalid host output fails loudly instead of being returned silently.
 
+Function calling passthrough: both completion tools also accept `tools` (a
+list of tool definitions) and `tool_choice`. They are forwarded into the
+sampling request on both eras (legacy sampling params, modern MRTR payload),
+fenced by the host's sampling.tools capability: a host that does not
+advertise tools support gets a tool-free request and answers in plain text,
+and the degradation is logged server-side. When the host answers with tool
+calls, the tool returns JSON text of the form
+{"text": ..., "tool_calls": [{"name": ..., "id": ..., "input": ...}]}; a
+plain-text answer still returns text as before. `tools` and `output_schema`
+cannot be combined: output_schema is the single-required-tool convenience
+for structured output, and combining them raises a clear error naming both.
+
 Era handling is explicit. The tool body reads the negotiated protocol
 version from the request Context and dispatches:
 
@@ -40,7 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+import logging
+from typing import Annotated, Literal
 
 import jsonschema
 from mcp.server.mcpserver import MCPServer
@@ -61,12 +74,13 @@ from mcp.types import (
     ModelPreferences,
     SamplingCapability,
     SamplingMessage,
+    TextContent,
     Tool,
     ToolChoice,
     ToolUseContent,
 )
 from mcp_types.version import is_version_at_least
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from agent_as_model import __version__
 from agent_as_model.protocol import (
@@ -102,6 +116,21 @@ _SAMPLE_INPUT_KEY = "sample"
 # tool forces the host to answer by invoking that tool, so its input IS the
 # structured completion.
 _STRUCTURED_OUTPUT_TOOL_NAME = "structured_output"
+
+logger = logging.getLogger("agent_as_model")
+
+
+class ToolDefinition(BaseModel):
+    """One caller-defined tool to forward to the host's model.
+
+    Callers pass these as plain dicts; the server validates them before they
+    travel anywhere. `input_schema` follows the MCP Tool inputSchema shape: a
+    JSON Schema object with root type "object".
+    """
+
+    name: str
+    description: str | None = None
+    input_schema: dict
 
 
 def _is_modern_era(protocol_version: str | None) -> bool:
@@ -148,24 +177,91 @@ def _require_sampling_capability(ctx: Context) -> None:
     )
 
 
-def _require_object_schema(output_schema: object) -> dict:
-    """Validate the caller's output_schema before it travels anywhere.
+def _require_object_schema(schema: object, param_name: str = "output_schema") -> dict:
+    """Validate a caller-supplied schema before it travels anywhere.
 
-    The single required tool carries it as its input schema, so it must be a
-    JSON Schema object with root type "object", and it must itself be a valid
-    schema. A bad schema is the caller's bug: fail here, loudly, not mid-flow.
+    It must be a JSON Schema object with root type "object", and it must
+    itself be a valid schema. A bad schema is the caller's bug: fail here,
+    loudly, not mid-flow.
     """
-    if not isinstance(output_schema, dict) or output_schema.get("type") != "object":
+    if not isinstance(schema, dict) or schema.get("type") != "object":
         raise ToolError(
-            "output_schema must be a JSON Schema object with root type 'object' "
-            f"(got {type(output_schema).__name__}); the single required sampling tool "
-            "carries it as its input schema"
+            f"{param_name} must be a JSON Schema object with root type 'object' "
+            f"(got {type(schema).__name__}); a sampling tool carries it as its "
+            "input schema"
         )
     try:
-        jsonschema.Draft202012Validator.check_schema(output_schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
-        raise ToolError(f"output_schema is not a valid JSON Schema: {exc.message}") from exc
-    return output_schema
+        raise ToolError(f"{param_name} is not a valid JSON Schema: {exc.message}") from exc
+    return schema
+
+
+def _validate_tool_definitions(definitions: list[ToolDefinition] | None) -> list[Tool] | None:
+    """Validate caller-supplied tool definitions and convert them to MCP tools.
+
+    Every definition needs a non-empty unique name and a valid object input
+    schema. Malformed tools are the caller's bug: they are rejected here,
+    never forwarded to the host.
+    """
+    if definitions is None:
+        return None
+    if not definitions:
+        raise ToolError("tools must be a non-empty list when given")
+    tools: list[Tool] = []
+    seen: set[str] = set()
+    for index, definition in enumerate(definitions):
+        name = definition.name.strip()
+        if not name:
+            raise ToolError(f"tools[{index}]: 'name' is required and must be a non-empty string")
+        if name in seen:
+            raise ToolError(f"tools[{index}]: duplicate tool name {name!r}")
+        seen.add(name)
+        input_schema = _require_object_schema(
+            definition.input_schema, param_name=f"tools[{index}].input_schema"
+        )
+        tools.append(Tool(name=name, description=definition.description, input_schema=input_schema))
+    return tools
+
+
+def _check_output_schema_tools_conflict(
+    output_schema: dict | None, tools: list[ToolDefinition] | list[Tool] | None
+) -> None:
+    """`tools` and `output_schema` are contradictory: output_schema is already
+    implemented as exactly one required tool, so asking for both leaves the
+    required-tool constraint ambiguous. Fail loud, naming both, instead of
+    silently preferring one."""
+    if output_schema is not None and tools is not None:
+        raise ToolError(
+            "tools and output_schema cannot be combined: output_schema is the "
+            "single-required-tool convenience for structured output; pass tools "
+            "or output_schema, not both"
+        )
+
+
+def _sampling_tools_supported(ctx: Context) -> bool:
+    """True when the host advertised the sampling.tools capability.
+
+    Presence of sampling.tools is what the spec uses to signal full tool
+    calling support in sampling requests. Absence (or no sampling capability
+    at all) means tools must not be sent.
+    """
+    capabilities = getattr(ctx, "client_capabilities", None)
+    sampling = getattr(capabilities, "sampling", None) if capabilities is not None else None
+    return sampling is not None and sampling.tools is not None
+
+
+def _warn_degraded_tools() -> None:
+    """Explicit, server-side record of the tools-to-plain-text degradation.
+
+    The tool result shape stays a plain text completion, so the warning goes
+    to the server log (and is documented in the tool descriptions) rather
+    than corrupting the return shape.
+    """
+    logger.warning(
+        "Host did not advertise the sampling.tools capability; the requested "
+        "tools were dropped and the call degrades to a plain-text completion"
+    )
 
 
 def _sampling_params(
@@ -175,6 +271,9 @@ def _sampling_params(
     max_tokens: int,
     model: str,
     output_schema: dict | None = None,
+    *,
+    tools: list[Tool] | None = None,
+    tool_choice: Literal["auto", "required", "none"] | None = None,
 ) -> CreateMessageRequestParams:
     """Build the request payload every era path carries: messages, system
     prompt, temperature, max_tokens, and the model hint.
@@ -183,11 +282,16 @@ def _sampling_params(
     input schema is that schema, marked as the required tool choice: the
     toolChoice-required trick for structured output. The host must answer by
     invoking the tool, so its tool-use input is the structured completion.
+
+    When caller tools are given (validated by _validate_tool_definitions),
+    they are forwarded as-is with the caller's tool choice, defaulting to
+    "auto". The sampling.tools capability fence is applied by _complete
+    before sending, not here.
     """
-    tools: list[Tool] | None = None
-    tool_choice: ToolChoice | None = None
+    out_tools: list[Tool] | None = None
+    out_tool_choice: ToolChoice | None = None
     if output_schema is not None:
-        tools = [
+        out_tools = [
             Tool(
                 name=_STRUCTURED_OUTPUT_TOOL_NAME,
                 description=(
@@ -197,45 +301,93 @@ def _sampling_params(
                 input_schema=_require_object_schema(output_schema),
             )
         ]
-        tool_choice = ToolChoice(mode="required")
+        out_tool_choice = ToolChoice(mode="required")
+    elif tools is not None:
+        out_tools = tools
+        out_tool_choice = ToolChoice(mode=tool_choice if tool_choice is not None else "auto")
     return CreateMessageRequestParams(
         messages=messages,
         system_prompt=system_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
         model_preferences=ModelPreferences(hints=[ModelHint(name=model)]),
-        tools=tools,
-        tool_choice=tool_choice,
+        tools=out_tools,
+        tool_choice=out_tool_choice,
     )
 
 
+def _format_tool_calls(result: CreateMessageResultWithTools) -> str:
+    """Format a tool-enabled host answer as the documented passthrough shape.
+
+    When the host invoked tools, the result is JSON text:
+    {"text": "...", "tool_calls": [{"name": ..., "id": ..., "input": ...}]},
+    with keys sorted for determinism. "text" carries any accompanying text
+    blocks (possibly ""). When the host answered in plain text despite being
+    offered tools, the text is returned as before: no JSON wrapper, the same
+    shape a tool-free call returns. Unknown content block types are a host
+    contract violation and fail loud.
+    """
+    blocks = result.content_as_list
+    texts: list[str] = []
+    calls: list[dict] = []
+    for block in blocks:
+        if isinstance(block, TextContent):
+            texts.append(block.text)
+        elif isinstance(block, ToolUseContent):
+            calls.append({"name": block.name, "id": block.id, "input": block.input})
+        else:
+            raise ToolError(
+                "Tool-enabled completion returned an unsupported content block "
+                f"{type(block).__name__}; the completion was rejected rather "
+                "than returned as-is"
+            )
+    text = "\n".join(texts)
+    if not calls:
+        return text
+    return json.dumps({"text": text, "tool_calls": calls}, sort_keys=True)
+
+
 async def _legacy_sample(
-    ctx: Context, params: CreateMessageRequestParams, output_schema: dict | None = None
+    ctx: Context,
+    params: CreateMessageRequestParams,
+    output_schema: dict | None = None,
+    *,
+    tools: list[Tool] | None = None,
 ) -> str:
     """Direct sampling/createMessage for pre-2026-07-28 connections.
 
     The era gate forbids this on modern connections; the sampling capability
     gate fails loud when the host did not declare it. With an output_schema
-    the required-tool response is extracted and validated against it.
+    the required-tool response is extracted and validated against it. With
+    caller tools (already fenced by _complete), a tool-calling answer comes
+    back in the documented passthrough JSON shape, and a plain-text answer
+    returns text as before.
     """
     _assert_legacy_sampling_allowed(ctx.protocol_version)
     if ctx.session.can_send_request:
         _require_sampling_capability(ctx)
-    if output_schema is None:
-        result = await ctx.session.send_request(
+    if output_schema is not None:
+        with_tools = await ctx.session.send_request(
             CreateMessageRequest(params=params),
-            CreateMessageResult,
+            CreateMessageResultWithTools,
             metadata=ServerMessageMetadata(related_request_id=ctx.request_id),
         )
-        return extract_text(result)
-    with_tools = await ctx.session.send_request(
+        output = _extract_structured_output(with_tools)
+        _validate_structured_output(output, output_schema)
+        return json.dumps(output, sort_keys=True)
+    if tools is not None:
+        tool_answer = await ctx.session.send_request(
+            CreateMessageRequest(params=params),
+            CreateMessageResultWithTools,
+            metadata=ServerMessageMetadata(related_request_id=ctx.request_id),
+        )
+        return _format_tool_calls(tool_answer)
+    result = await ctx.session.send_request(
         CreateMessageRequest(params=params),
-        CreateMessageResultWithTools,
+        CreateMessageResult,
         metadata=ServerMessageMetadata(related_request_id=ctx.request_id),
     )
-    output = _extract_structured_output(with_tools)
-    _validate_structured_output(output, output_schema)
-    return json.dumps(output, sort_keys=True)
+    return extract_text(result)
 
 
 def _extract_structured_output(result: CreateMessageResultWithTools) -> dict:
@@ -293,12 +445,16 @@ def _mrtr_completion_request(params: CreateMessageRequestParams) -> InputRequire
     )
 
 
-def _mrtr_completion_result(ctx: Context, output_schema: dict | None = None) -> str | None:
+def _mrtr_completion_result(
+    ctx: Context, output_schema: dict | None = None, *, tools: list[Tool] | None = None
+) -> str | None:
     """Second MRTR round: the host's fulfilled completion, or None on round one.
 
     With an output_schema the host must answer through the required tool: the
     tool-use input is extracted and validated, and a plain-text answer is a
-    contract violation, not a completion.
+    contract violation, not a completion. With caller tools (already fenced by
+    _complete), a tool-calling answer comes back in the documented passthrough
+    JSON shape, and a plain-text answer returns text as before.
     """
     responses = ctx.input_responses
     if not responses:
@@ -317,6 +473,8 @@ def _mrtr_completion_result(ctx: Context, output_schema: dict | None = None) -> 
         output = _extract_structured_output(response)
         _validate_structured_output(output, output_schema)
         return json.dumps(output, sort_keys=True)
+    if tools is not None and isinstance(response, CreateMessageResultWithTools):
+        return _format_tool_calls(response)
     if isinstance(response, CreateMessageResult | CreateMessageResultWithTools):
         return extract_text(response)
     raise ToolError(
@@ -327,15 +485,32 @@ def _mrtr_completion_result(ctx: Context, output_schema: dict | None = None) -> 
 
 
 async def _complete(
-    ctx: Context, params: CreateMessageRequestParams, output_schema: dict | None = None
+    ctx: Context,
+    params: CreateMessageRequestParams,
+    output_schema: dict | None = None,
+    *,
+    tools: list[Tool] | None = None,
+    tool_choice: Literal["auto", "required", "none"] | None = None,
 ) -> str | InputRequiredResult:
-    """Era dispatch: MRTR InputRequiredResult on 2026-07-28+, direct sampling before."""
+    """Era dispatch: MRTR InputRequiredResult on 2026-07-28+, direct sampling before.
+
+    Applies the sampling.tools capability fence: when caller tools were
+    requested but the host did not advertise tools support, the tools are
+    dropped here (on both eras), the degradation is logged, and the call
+    proceeds as a plain-text completion. The conflict between tools and
+    output_schema fails loud before anything travels.
+    """
+    _check_output_schema_tools_conflict(output_schema, tools)
+    if tools is not None and not _sampling_tools_supported(ctx):
+        _warn_degraded_tools()
+        params = params.model_copy(update={"tools": None, "tool_choice": None})
+        tools = None
     if _is_modern_era(ctx.protocol_version):
-        completed = _mrtr_completion_result(ctx, output_schema)
+        completed = _mrtr_completion_result(ctx, output_schema, tools=tools)
         if completed is None:
             return _mrtr_completion_request(params)
         return completed
-    return await _legacy_sample(ctx, params, output_schema)
+    return await _legacy_sample(ctx, params, output_schema, tools=tools)
 
 
 @mcp.tool(
@@ -347,6 +522,14 @@ async def _complete(
         "When output_schema is given, the request carries exactly one required tool "
         "whose input schema is that schema, and the validated structured completion "
         "is returned as JSON text. "
+        "When tools is given, the tool definitions are forwarded to the host's model "
+        "with tool_choice, but only if the host advertised the sampling.tools "
+        "capability: otherwise the tools are dropped (a warning is logged server-side) "
+        "and the call degrades to a plain-text completion. "
+        "When the host answers by calling tools, the returned text is JSON: "
+        '{"text": "...", "tool_calls": [{"id": "...", "input": {...}, "name": "..."}]} '
+        "(keys sorted). A plain-text host answer returns text as before. "
+        "tools and output_schema cannot be combined. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -373,13 +556,42 @@ async def chat_complete(
             )
         ),
     ] = None,
+    tools: Annotated[
+        list[ToolDefinition] | None,
+        Field(
+            description=(
+                "Optional tool definitions to forward to the host's model. Each is "
+                "{name, description, input_schema} where input_schema is a JSON "
+                "Schema object with root type 'object'. Forwarded only when the "
+                "host advertised the sampling.tools capability; otherwise dropped "
+                "with a server-side warning and the call degrades to plain text."
+            )
+        ),
+    ] = None,
+    tool_choice: Annotated[
+        Literal["auto", "required", "none"] | None,
+        Field(
+            description=(
+                "Optional tool-choice mode, forwarded with tools; defaults to "
+                "'auto' when tools are given."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a chat with the host agent's model (OpenAI request shape)."""
+    validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = openai_to_sampling(messages)
     params = _sampling_params(
-        sampling_messages, system_prompt, temperature, max_tokens, model, output_schema
+        sampling_messages,
+        system_prompt,
+        temperature,
+        max_tokens,
+        model,
+        output_schema,
+        tools=validated_tools,
+        tool_choice=tool_choice,
     )
-    return await _complete(ctx, params, output_schema)
+    return await _complete(ctx, params, output_schema, tools=validated_tools)
 
 
 @mcp.tool(
@@ -391,6 +603,14 @@ async def chat_complete(
         "When output_schema is given, the request carries exactly one required tool "
         "whose input schema is that schema, and the validated structured completion "
         "is returned as JSON text. "
+        "When tools is given, the tool definitions are forwarded to the host's model "
+        "with tool_choice, but only if the host advertised the sampling.tools "
+        "capability: otherwise the tools are dropped (a warning is logged server-side) "
+        "and the call degrades to a plain-text completion. "
+        "When the host answers by calling tools, the returned text is JSON: "
+        '{"text": "...", "tool_calls": [{"id": "...", "input": {...}, "name": "..."}]} '
+        "(keys sorted). A plain-text host answer returns text as before. "
+        "tools and output_schema cannot be combined. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -420,13 +640,42 @@ async def messages_create(
             )
         ),
     ] = None,
+    tools: Annotated[
+        list[ToolDefinition] | None,
+        Field(
+            description=(
+                "Optional tool definitions to forward to the host's model. Each is "
+                "{name, description, input_schema} where input_schema is a JSON "
+                "Schema object with root type 'object'. Forwarded only when the "
+                "host advertised the sampling.tools capability; otherwise dropped "
+                "with a server-side warning and the call degrades to plain text."
+            )
+        ),
+    ] = None,
+    tool_choice: Annotated[
+        Literal["auto", "required", "none"] | None,
+        Field(
+            description=(
+                "Optional tool-choice mode, forwarded with tools; defaults to "
+                "'auto' when tools are given."
+            )
+        ),
+    ] = None,
 ) -> str | InputRequiredResult:
     """Complete a conversation with the host agent's model (Anthropic request shape)."""
+    validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = anthropic_to_sampling(messages, system)
     params = _sampling_params(
-        sampling_messages, system_prompt, temperature, max_tokens, model, output_schema
+        sampling_messages,
+        system_prompt,
+        temperature,
+        max_tokens,
+        model,
+        output_schema,
+        tools=validated_tools,
+        tool_choice=tool_choice,
     )
-    return await _complete(ctx, params, output_schema)
+    return await _complete(ctx, params, output_schema, tools=validated_tools)
 
 
 @mcp.tool(
