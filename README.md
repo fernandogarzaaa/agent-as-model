@@ -10,7 +10,77 @@ mcp-name: io.github.fernandogarzaaa/agent-as-model
 uvx agent-as-model
 ```
 
-Claude Code:
+One-click install for VS Code:
+
+[![Install in VS Code](https://img.shields.io/badge/Install_in-VS_Code-0098FF)](vscode:mcp/install?%7B%22name%22%3A%22agent-as-model%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22agent-as-model%22%5D%7D)
+
+The deep link carries the server's real install config
+(`{"name":"agent-as-model","command":"uvx","args":["agent-as-model"]}`)
+URL-encoded in the `vscode:mcp/install?` handler, the format from the
+official VS Code MCP developer guide.
+
+### Host scope: sampling-capable hosts only
+
+This server does its work through MCP sampling, so one-click install
+and the guides below are scoped to sampling-capable hosts: VS Code,
+Goose, fast-agent, and opencode. Claude Code and Cursor are excluded
+until they implement sampling. The manual Claude Code instructions
+further down stay for anyone who wants to experiment anyway.
+
+### Goose
+
+Add to `~/.config/goose/config.yaml` (or use `goose configure` and
+pick Add Extension, Command-line Extension):
+
+```yaml
+extensions:
+  agent-as-model:
+    enabled: true
+    type: stdio
+    name: agent-as-model
+    cmd: uvx
+    args: ["agent-as-model"]
+    timeout: 300
+```
+
+### fast-agent
+
+Add under `mcp.servers` in `fastagent.config.yaml`, then include
+`agent-as-model` in your agent's `servers=[...]` list:
+
+```yaml
+mcp:
+  servers:
+    agent-as-model:
+      transport: "stdio"
+      command: "uvx"
+      args: ["agent-as-model"]
+```
+
+### opencode
+
+```bash
+opencode mcp add agent-as-model -- uvx agent-as-model
+```
+
+Or in `opencode.json` (project root or `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "agent-as-model": {
+      "type": "local",
+      "command": ["uvx", "agent-as-model"]
+    }
+  }
+}
+```
+
+### Manual
+
+Claude Code (kept as manual instructions; excluded from one-click
+until sampling is implemented):
 
 ```bash
 claude mcp add agent-as-model -- uvx agent-as-model
