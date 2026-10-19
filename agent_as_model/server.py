@@ -65,6 +65,7 @@ trip.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -103,6 +104,8 @@ from agent_as_model.protocol import (
     AnthropicMessage,
     ChatMessage,
     ResponseInputItem,
+    _response_item_text,
+    _text_of,
     anthropic_to_sampling,
     extract_text,
     openai_to_sampling,
@@ -380,6 +383,198 @@ def _finish_persona(
     if isinstance(result, InputRequiredResult):
         return result
     return _validate_persona_output(persona, result)
+
+
+# ---------------------------------------------------------------------------
+# Item 6: host-owned session cursors (previous_response_id / response_id)
+# ---------------------------------------------------------------------------
+#
+# The server is stateless: it keeps no sessions and no history. Multi-turn
+# continuations are host-owned: the caller passes the accumulated history back
+# in on each call, and the previous turn's cursor in previous_response_id.
+#
+# A cursor is "cur_" + the sha256 hex of the canonical JSON
+# {"model", "tool", "transcript"} (sorted keys, compact separators), where the
+# transcript is the conversation through the assistant turn being committed,
+# as {"role", "content"} entries. It is a tamper-evident commitment: anyone
+# holding the transcript can recompute it, and any modification of the history
+# changes it. No server state is involved.
+#
+# previous_response_id has four accepted forms:
+# - None (omitted): the cursor protocol is off. The tool returns exactly what
+#   it returned before this item: plain text for the text tools, the response
+#   object with a "resp_"-prefixed unique id for responses_create.
+# - "": start a cursor chain. Nothing is verified; the response carries the
+#   newly minted cursor.
+# - "cur_<64 hex>": continue a verified chain. The server recomputes the
+#   cursor over the history passed back (cut at the last assistant message)
+#   and fails loud, naming expected vs received, on mismatch.
+# - "resp_<32 hex>": an opaque responses_create response id. It commits to
+#   nothing (uuid4), so it cannot be verified; it anchors a new verifiable
+#   chain at the history passed back instead of failing.
+# Anything else fails loud as an unrecognized cursor format.
+#
+# generate is the exception: the thin path has no structured history channel
+# (the prompt is the only input), so a "cur_" cursor can never be verified
+# there. Passing one fails loud and says so, instead of silently skipping the
+# check. Pass "" to mint a cursor over the current prompt and completion;
+# cursors are deterministic, so the caller can always re-derive and check them
+# against the documented canonical form.
+
+_CURSOR_PREFIX = "cur_"
+_OPAQUE_ID_PREFIX = "resp_"
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _canonical_json(obj: object) -> str:
+    """Canonical JSON for cursor commitments: sorted keys, compact separators."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _mint_cursor(tool: str, model: str, transcript: list[dict[str, str]]) -> str:
+    """Mint the tamper-evident session cursor for one completed turn.
+
+    The commitment covers the tool name (cursors do not replay across tools),
+    the model alias (a model change breaks the chain loudly), and the
+    transcript through the assistant turn being committed. Deterministic: the
+    caller can recompute any cursor from the transcript it holds.
+    """
+    canonical = _canonical_json({"model": model, "tool": tool, "transcript": transcript})
+    return _CURSOR_PREFIX + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _is_cursor(value: str) -> bool:
+    """A verifiable cursor: "cur_" + 64 lowercase hex chars (a sha256 hex digest)."""
+    return (
+        value.startswith(_CURSOR_PREFIX)
+        and len(value) == len(_CURSOR_PREFIX) + 64
+        and all(char in _HEX_DIGITS for char in value[len(_CURSOR_PREFIX) :])
+    )
+
+
+def _is_opaque_response_id(value: str) -> bool:
+    """An opaque responses_create response id: "resp_" + 32 hex chars (uuid4 hex).
+
+    Opaque by construction: it identifies the response but commits to nothing,
+    so it can anchor a new chain but never continue a verified one.
+    """
+    return (
+        value.startswith(_OPAQUE_ID_PREFIX)
+        and len(value) == len(_OPAQUE_ID_PREFIX) + 32
+        and all(char in _HEX_DIGITS for char in value[len(_OPAQUE_ID_PREFIX) :])
+    )
+
+
+def _cursor_history_chat(messages: list[ChatMessage]) -> list[dict[str, str]]:
+    """Canonical transcript entries for the caller's chat messages.
+
+    The caller's message list verbatim, as {"role", "content"} entries: system
+    messages stay in the list, because this is the caller's OpenAI transcript,
+    not the folded sampling translation. The new assistant turn is appended by
+    the caller of this helper.
+    """
+    return [{"role": message.role, "content": message.content} for message in messages]
+
+
+def _cursor_history_anthropic(
+    messages: list[AnthropicMessage], system: str | list[AnthropicContentBlock] | None
+) -> list[dict[str, str]]:
+    """Canonical transcript entries: the flattened system prompt first when the
+    caller gave one, then the messages in order with block content flattened."""
+    entries: list[dict[str, str]] = []
+    if system is not None:
+        entries.append({"role": "system", "content": _text_of(system)})
+    entries.extend(
+        {"role": message.role, "content": _text_of(message.content)} for message in messages
+    )
+    return entries
+
+
+def _cursor_history_responses(
+    input: str | list[ResponseInputItem], instructions: str | None
+) -> list[dict[str, str]]:
+    """Canonical transcript entries: instructions as the leading system entry when
+    given, then the input items in order with text flattened. System and
+    developer items keep their own roles: this is the caller's transcript, not
+    the folded sampling translation."""
+    entries: list[dict[str, str]] = []
+    if instructions is not None:
+        entries.append({"role": "system", "content": instructions})
+    if isinstance(input, str):
+        entries.append({"role": "user", "content": input})
+    else:
+        for item in input:
+            entries.append({"role": item.role, "content": _response_item_text(item)})
+    return entries
+
+
+def _check_previous_response_id(
+    tool: str,
+    model: str,
+    history: list[dict[str, str]],
+    previous_response_id: str | None,
+    *,
+    verifiable: bool = True,
+) -> None:
+    """Request gate: a supplied previous_response_id must match the history.
+
+    "" starts a chain (nothing to verify); a "resp_" id anchors a new chain at
+    the passed history (opaque ids commit to nothing); a "cur_" cursor is
+    recomputed over the history cut at its last assistant message and must
+    match exactly, failing loud naming expected vs received. Anything else is
+    an unrecognized cursor format and fails loud. `verifiable=False` is the
+    generate thin path: it has no structured history channel, so a "cur_"
+    cursor can never be checked there and fails loud saying so instead of
+    silently skipping verification.
+    """
+    if previous_response_id is None or previous_response_id == "":
+        return
+    if _is_opaque_response_id(previous_response_id):
+        return
+    if not _is_cursor(previous_response_id):
+        raise ToolError(
+            f"previous_response_id has an unrecognized format ({previous_response_id!r}): "
+            "expected '' to start a cursor chain, 'cur_<64 hex chars>' to continue a "
+            "verified chain, or 'resp_<32 hex chars>' (a responses_create response id) "
+            "to anchor a new chain at the history passed back"
+        )
+    if not verifiable:
+        raise ToolError(
+            f"{tool} cannot verify previous_response_id against history: the thin path "
+            "has no structured history channel (the prompt is the only input), so a "
+            "'cur_' cursor can never be checked here. Pass previous_response_id='' to "
+            "mint a cursor over the current prompt and completion instead; cursors are "
+            "deterministic, so the caller can re-derive and check them against the "
+            "documented canonical form."
+        )
+    last_assistant = max(
+        (index for index, entry in enumerate(history) if entry["role"] == "assistant"),
+        default=None,
+    )
+    if last_assistant is None:
+        raise ToolError(
+            "previous_response_id was supplied but the history passed back contains no "
+            "assistant message: the cursor commits to the transcript through the "
+            "previous assistant turn, so pass the accumulated history including the "
+            "previous assistant message(s), or '' to start a new chain"
+        )
+    expected = _mint_cursor(tool, model, history[: last_assistant + 1])
+    if expected != previous_response_id:
+        raise ToolError(
+            f"previous_response_id mismatch: expected {expected} for the history passed "
+            f"back, received {previous_response_id}; the history does not match the "
+            "conversation the cursor was minted for (modified history, a different "
+            "model or tool, or a cursor from another conversation)"
+        )
+
+
+def _cursor_envelope(completion: str, cursor: str) -> str:
+    """The cursor-active return shape for the text tools: JSON text carrying the
+    completion exactly as the legacy path would have returned it, plus the
+    response cursor. Keys are sorted for a deterministic wire shape (the
+    insertion order below is deliberately unsorted, so a sort_keys flip
+    changes the string). Callers that omit previous_response_id never see this."""
+    return json.dumps({"response_id": cursor, "completion": completion}, sort_keys=True)
 
 
 def _sampling_tools_supported(ctx: Context) -> bool:
@@ -755,6 +950,21 @@ async def _complete(
         "must parse as JSON validating against output_schema. The server is "
         "stateless and keeps no persona registry. persona.output_schema and "
         "output_schema cannot be combined. "
+        "Session cursors: the server keeps no session state. To continue a "
+        "conversation, pass the accumulated history back in and the previous "
+        "turn's cursor as previous_response_id: '' starts a cursor chain "
+        "(nothing verified), 'cur_<64 hex>' continues a verified chain "
+        "(checked against the history passed back; mismatch fails loud naming "
+        "expected vs received), 'resp_<32 hex>' (a responses_create response id) "
+        "anchors a new chain at the passed history. When previous_response_id is "
+        "given, the completion returns as JSON "
+        '\'{"completion": "<text>", "response_id": "cur_<...>"}\' instead of '
+        "plain text; when omitted the tool returns plain text exactly as before. "
+        "The cursor is 'cur_' + sha256 over canonical JSON "
+        '\'{"model","tool","transcript"}\' (sorted keys, compact separators), '
+        "the transcript being the conversation through the assistant turn, so the "
+        "caller can recompute it. Re-supply previous_response_id on the MRTR retry "
+        "round on 2026-07-28+ connections, like persona. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -810,11 +1020,30 @@ async def chat_complete(
                 "output_schema}. name is required and non-empty; the server is "
                 "stateless and keeps no persona registry. When input_schema is "
                 "given, the request arguments (messages, model, temperature, "
-                "max_tokens, output_schema, tools, tool_choice) are validated "
+                "max_tokens, output_schema, tools, tool_choice, "
+                "previous_response_id) are validated "
                 "against it before anything is sent. When output_schema is "
                 "given, the host's completion text must parse as JSON "
                 "validating against it. persona.output_schema and output_schema "
                 "cannot be combined."
+            )
+        ),
+    ] = None,
+    previous_response_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional session cursor for host-owned multi-turn continuations. "
+                "The server keeps no session state: pass the accumulated history "
+                "back in messages and the previous turn's cursor here. '' starts "
+                "a cursor chain (nothing verified); 'cur_<64 hex>' continues a "
+                "verified chain, checked against the history passed back "
+                "(mismatch fails loud, naming expected vs received); "
+                "'resp_<32 hex>' (a responses_create response id) anchors a new "
+                "chain at the passed history. When given, the completion returns "
+                'as JSON \'{"completion": "<text>", "response_id": '
+                '"cur_<...>"}\' instead of plain text; when omitted the tool '
+                "returns plain text exactly as before."
             )
         ),
     ] = None,
@@ -824,6 +1053,8 @@ async def chat_complete(
     _check_output_schema_persona_conflict(output_schema, persona)
     validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = openai_to_sampling(messages)
+    history = _cursor_history_chat(messages)
+    _check_previous_response_id("chat_complete", model, history, previous_response_id)
     _validate_persona_request(
         persona,
         {
@@ -834,6 +1065,7 @@ async def chat_complete(
             "output_schema": output_schema,
             "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
             "tool_choice": tool_choice,
+            "previous_response_id": previous_response_id,
         },
     )
     params = _sampling_params(
@@ -846,9 +1078,17 @@ async def chat_complete(
         tools=validated_tools,
         tool_choice=tool_choice,
     )
-    return _finish_persona(
+    completed = _finish_persona(
         persona, await _complete(ctx, params, output_schema, tools=validated_tools)
     )
+    if isinstance(completed, InputRequiredResult):
+        return completed
+    if previous_response_id is None:
+        return completed
+    cursor = _mint_cursor(
+        "chat_complete", model, [*history, {"role": "assistant", "content": completed}]
+    )
+    return _cursor_envelope(completed, cursor)
 
 
 @mcp.tool(
@@ -874,6 +1114,21 @@ async def chat_complete(
         "must parse as JSON validating against output_schema. The server is "
         "stateless and keeps no persona registry. persona.output_schema and "
         "output_schema cannot be combined. "
+        "Session cursors: the server keeps no session state. To continue a "
+        "conversation, pass the accumulated history back in and the previous "
+        "turn's cursor as previous_response_id: '' starts a cursor chain "
+        "(nothing verified), 'cur_<64 hex>' continues a verified chain "
+        "(checked against the history passed back; mismatch fails loud naming "
+        "expected vs received), 'resp_<32 hex>' (a responses_create response id) "
+        "anchors a new chain at the passed history. When previous_response_id is "
+        "given, the completion returns as JSON "
+        '\'{"completion": "<text>", "response_id": "cur_<...>"}\' instead of '
+        "plain text; when omitted the tool returns plain text exactly as before. "
+        "The cursor is 'cur_' + sha256 over canonical JSON "
+        '\'{"model","tool","transcript"}\' (sorted keys, compact separators), '
+        "the transcript being the conversation through the assistant turn, so the "
+        "caller can recompute it. Re-supply previous_response_id on the MRTR retry "
+        "round on 2026-07-28+ connections, like persona. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -932,11 +1187,30 @@ async def messages_create(
                 "output_schema}. name is required and non-empty; the server is "
                 "stateless and keeps no persona registry. When input_schema is "
                 "given, the request arguments (messages, model, system, "
-                "temperature, max_tokens, output_schema, tools, tool_choice) "
+                "temperature, max_tokens, output_schema, tools, tool_choice, "
+                "previous_response_id) "
                 "are validated against it before anything is sent. When "
                 "output_schema is given, the host's completion text must parse "
                 "as JSON validating against it. persona.output_schema and "
                 "output_schema cannot be combined."
+            )
+        ),
+    ] = None,
+    previous_response_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional session cursor for host-owned multi-turn continuations. "
+                "The server keeps no session state: pass the accumulated history "
+                "back in messages and the previous turn's cursor here. '' starts "
+                "a cursor chain (nothing verified); 'cur_<64 hex>' continues a "
+                "verified chain, checked against the history passed back "
+                "(mismatch fails loud, naming expected vs received); "
+                "'resp_<32 hex>' (a responses_create response id) anchors a new "
+                "chain at the passed history. When given, the completion returns "
+                'as JSON \'{"completion": "<text>", "response_id": '
+                '"cur_<...>"}\' instead of plain text; when omitted the tool '
+                "returns plain text exactly as before."
             )
         ),
     ] = None,
@@ -946,6 +1220,8 @@ async def messages_create(
     _check_output_schema_persona_conflict(output_schema, persona)
     validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = anthropic_to_sampling(messages, system)
+    history = _cursor_history_anthropic(messages, system)
+    _check_previous_response_id("messages_create", model, history, previous_response_id)
     _validate_persona_request(
         persona,
         {
@@ -959,6 +1235,7 @@ async def messages_create(
             "output_schema": output_schema,
             "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
             "tool_choice": tool_choice,
+            "previous_response_id": previous_response_id,
         },
     )
     params = _sampling_params(
@@ -971,9 +1248,17 @@ async def messages_create(
         tools=validated_tools,
         tool_choice=tool_choice,
     )
-    return _finish_persona(
+    completed = _finish_persona(
         persona, await _complete(ctx, params, output_schema, tools=validated_tools)
     )
+    if isinstance(completed, InputRequiredResult):
+        return completed
+    if previous_response_id is None:
+        return completed
+    cursor = _mint_cursor(
+        "messages_create", model, [*history, {"role": "assistant", "content": completed}]
+    )
+    return _cursor_envelope(completed, cursor)
 
 
 @mcp.tool(
@@ -1009,6 +1294,21 @@ async def messages_create(
         "must parse as JSON validating against output_schema. The server is "
         "stateless and keeps no persona registry. persona.output_schema and "
         "output_schema cannot be combined. "
+        "Session cursors: the server keeps no session state. To continue a "
+        "conversation, pass the accumulated history back in input and the previous "
+        "turn's response id as previous_response_id: '' starts a cursor chain "
+        "(nothing verified), 'cur_<64 hex>' continues a verified chain "
+        "(checked against the history passed back; mismatch fails loud naming "
+        "expected vs received), 'resp_<32 hex>' (a previous response id) anchors "
+        "a new chain at the passed history. The response object's id field IS "
+        "the cursor: when previous_response_id is given it carries the 'cur_' "
+        "tamper-evident commitment, when omitted it stays the opaque 'resp_' "
+        "unique id exactly as before. The cursor is 'cur_' + sha256 over "
+        'canonical JSON \'{"model","tool","transcript"}\' (sorted keys, '
+        "compact separators), the transcript being the conversation through the "
+        "assistant turn, so the caller can recompute it. Re-supply "
+        "previous_response_id on the MRTR retry round on 2026-07-28+ "
+        "connections, like persona. "
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -1086,11 +1386,29 @@ async def responses_create(
                 "output_schema}. name is required and non-empty; the server is "
                 "stateless and keeps no persona registry. When input_schema is "
                 "given, the request arguments (input, instructions, model, "
-                "temperature, max_tokens, output_schema, tools, tool_choice) "
+                "temperature, max_tokens, output_schema, tools, tool_choice, "
+                "previous_response_id) "
                 "are validated against it before anything is sent. When "
                 "output_schema is given, the host's completion text must parse "
                 "as JSON validating against it. persona.output_schema and "
                 "output_schema cannot be combined."
+            )
+        ),
+    ] = None,
+    previous_response_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional session cursor for host-owned multi-turn continuations. "
+                "The server keeps no session state: pass the accumulated history "
+                "back in input and the previous turn's response id here. '' "
+                "starts a cursor chain (nothing verified); 'cur_<64 hex>' "
+                "continues a verified chain, checked against the history passed "
+                "back (mismatch fails loud, naming expected vs received); "
+                "'resp_<32 hex>' (a previous response id) anchors a new chain "
+                "at the passed history. When given, the response object's id "
+                "field carries the 'cur_' cursor; when omitted the id stays the "
+                "opaque 'resp_' unique id exactly as before."
             )
         ),
     ] = None,
@@ -1100,6 +1418,8 @@ async def responses_create(
     _check_output_schema_persona_conflict(output_schema, persona)
     validated_tools = _validate_tool_definitions(tools)
     system_prompt, sampling_messages = responses_to_sampling(input, instructions)
+    history = _cursor_history_responses(input, instructions)
+    _check_previous_response_id("responses_create", model, history, previous_response_id)
     _validate_persona_request(
         persona,
         {
@@ -1111,6 +1431,7 @@ async def responses_create(
             "output_schema": output_schema,
             "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
             "tool_choice": tool_choice,
+            "previous_response_id": previous_response_id,
         },
     )
     params = _sampling_params(
@@ -1131,11 +1452,24 @@ async def responses_create(
     # The predicate mirrors the capability fence inside _complete: tools count
     # as used exactly when they were forwarded to the host, so a plain-text
     # answer to a degraded tools request is never misread as tool calls.
-    return _responses_object(
+    response_object = _responses_object(
         completed,
         model,
         used_tools=validated_tools is not None and _sampling_tools_supported(ctx),
     )
+    if previous_response_id is not None:
+        # The id field IS the cursor: on the cursor path it carries the
+        # tamper-evident commitment instead of the opaque unique id. The
+        # assistant entry commits the completion text exactly as the sampling
+        # layer returned it (the output_text string, before function_call
+        # splitting), so the caller passes that text back as the assistant
+        # content when continuing.
+        response_object["id"] = _mint_cursor(
+            "responses_create",
+            model,
+            [*history, {"role": "assistant", "content": completed}],
+        )
+    return response_object
 
 
 @mcp.tool(
@@ -1149,6 +1483,17 @@ async def responses_create(
         "contract ({name, input_schema, output_schema}): request/response "
         "validation only, never a sampling feature, so the thin path stays "
         "zero overhead. "
+        "Session cursors: the server keeps no session state. previous_response_id "
+        "'' mints a cursor over the current prompt and completion, returned as "
+        'JSON \'{"completion": "<text>", "response_id": "cur_<...>"}\' '
+        "instead of plain text; when omitted the tool returns plain text exactly "
+        "as before. generate has no structured history channel (the prompt is the "
+        "only input), so a 'cur_' cursor can never be verified here: passing one "
+        "fails loud instead of silently skipping the check. The cursor is 'cur_' "
+        '+ sha256 over canonical JSON \'{"model","tool","transcript"}\' '
+        "(sorted keys, compact separators) with the transcript "
+        '[{"role": "user", "content": <prompt>}, {"role": "assistant", '
+        '"content": <completion>}], so the caller can recompute it. '
         "No API key is used or needed: the connected agent is the model."
     )
 )
@@ -1172,15 +1517,33 @@ async def generate(
                 "output_schema}. name is required and non-empty; the server is "
                 "stateless and keeps no persona registry. When input_schema is "
                 "given, the request arguments (prompt, model, temperature, "
-                "max_tokens) are validated against it before anything is sent. "
+                "max_tokens, previous_response_id) are validated against it "
+                "before anything is sent. "
                 "When output_schema is given, the host's completion text must "
                 "parse as JSON validating against it."
+            )
+        ),
+    ] = None,
+    previous_response_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional session cursor for host-owned continuations. '' mints "
+                "a cursor over the current prompt and completion, returned as "
+                'JSON \'{"completion": "<text>", "response_id": '
+                '"cur_<...>"}\' instead of plain text; when omitted the tool '
+                "returns plain text exactly as before. generate has no "
+                "structured history channel, so a 'cur_' cursor can never be "
+                "verified here and fails loud rather than silently skipping "
+                "the check."
             )
         ),
     ] = None,
 ) -> str | InputRequiredResult:
     """Generate a completion from a raw prompt with the host agent's model."""
     persona = _validate_persona(persona)
+    history = [{"role": "user", "content": prompt}]
+    _check_previous_response_id("generate", model, history, previous_response_id, verifiable=False)
     _validate_persona_request(
         persona,
         {
@@ -1188,6 +1551,7 @@ async def generate(
             "model": model,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "previous_response_id": previous_response_id,
         },
     )
     params = _sampling_params(
@@ -1197,7 +1561,15 @@ async def generate(
         max_tokens,
         model,
     )
-    return _finish_persona(persona, await _complete(ctx, params))
+    completed = _finish_persona(persona, await _complete(ctx, params))
+    if isinstance(completed, InputRequiredResult):
+        return completed
+    if previous_response_id is None:
+        return completed
+    cursor = _mint_cursor(
+        "generate", model, [*history, {"role": "assistant", "content": completed}]
+    )
+    return _cursor_envelope(completed, cursor)
 
 
 @mcp.tool(

@@ -141,6 +141,28 @@ plain text and the server parses it. Passing both `output_schema` and
 `persona.output_schema` is an error: the two are contradictory sources of
 the structured-output contract.
 
+**Continuing a conversation** — the server keeps no session state, so
+multi-turn continuations are host-owned. All four completion tools accept an
+optional `previous_response_id`, and every completion response carries a
+cursor you pass back to continue. The cursor is `cur_` + sha256 over the
+canonical JSON `{"model","tool","transcript"}` (sorted keys, compact
+separators), the transcript being the conversation through the assistant
+turn: a tamper-evident commitment, deterministic, so you can recompute it
+yourself. Pass `""` to start a chain. To continue, pass the accumulated
+history back in (including the previous assistant turn, exactly as received)
+with the previous turn's cursor: the server recomputes the cursor over your
+history and fails loud, naming expected vs received, if it does not match.
+A `responses_create` response id (`resp_...`) anchors a new chain instead of
+failing, since opaque ids commit to nothing. When `previous_response_id` is
+given, the text tools return `{"completion": "<text>", "response_id":
+"cur_<...>"}` instead of plain text; `responses_create` carries the cursor
+in its `id` field. Omit `previous_response_id` and everything behaves
+exactly as before. To branch from an earlier turn, truncate the history to
+that turn and pass its cursor. On `generate` (no structured history
+channel) a `cur_` cursor fails loud rather than silently skipping
+verification; pass `""` to mint a cursor over the current prompt and
+completion.
+
 ## How it works
 
 1. A product (or agent) calls `chat_complete` with ordinary chat messages.
@@ -191,7 +213,7 @@ python3 -m pytest tests/ -q
 python3 -m ruff format . && python3 -m ruff check .
 ```
 
-74 tests, all green: message translation unit tests plus end-to-end runs of
+125 tests, all green: message translation unit tests plus end-to-end runs of
 the full MCP loop (tool call to sampled completion) against a scripted host
 on both the modern multi-round-trip era and the legacy direct-sampling era,
 including the structured-output paths (single required tool in the sampling
@@ -200,9 +222,18 @@ the tool-use passthrough paths (tools and tool_choice forwarded on both
 eras, capability-absent degradation to plain text with an explicit logged
 warning, documented JSON result shape, and the tools/output_schema conflict),
 the generate tool (single user message with no system prompt and no
-tools on both eras, param pass-through, tool listing, description), and the
+tools on both eras, param pass-through, tool listing, description), the
 persona paths (persona advertised on all three completion tools,
 request-side validation success and rejection-before-sending, response-side
 validation success and loud failure, malformed-persona rejection, the
 output_schema/persona.output_schema conflict, identical behavior on both
-eras).
+eras), and the host-owned session cursor protocol (pinned canonical cursor
+computation; chain start; verified multi-turn continuation happy path on
+both eras with cross-era cursor agreement; tampered history failing loud
+naming expected vs received across edited user turn, edited assistant turn,
+and changed model; malformed cursor formats; the opaque `resp_` id
+anchoring a new chain; legacy return shapes untouched when
+`previous_response_id` is omitted; `responses_create` id-as-cursor on the
+cursor path; the `generate` thin-path verification limit;
+branch-by-truncation; MRTR round-one verification before any
+InputRequiredResult is returned).

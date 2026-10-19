@@ -12,7 +12,12 @@ model.
   this spec; products that only speak HTTP are out of scope for v1.
 - No provider API keys in v1. A fallback is roadmap-only and stays opt-in.
 - No embeddings, no image/audio generation. Sampling produces text.
-- No multi-turn session state. Each tool call is self-contained.
+- No server-side session state. The server keeps no sessions and no history;
+  each tool call is self-contained. Multi-turn continuations are host-owned
+  via the cursor protocol (`previous_response_id` / `response_id`), which is
+  stateless by construction: the caller passes the accumulated history back
+  in, and the cursor is a tamper-evident commitment over that history, not a
+  server-side lookup.
 
 ## Architecture
 
@@ -80,9 +85,11 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   `object`, validated before anything is sent.
 - A persona's `input_schema` constrains the tool's request arguments (the
   parameter set with defaults applied, minus `persona` itself: messages,
-  model, temperature, max_tokens, output_schema, tools, tool_choice on the
-  chat tools, plus system on messages_create; prompt, model, temperature,
-  max_tokens on generate). Its `output_schema` constrains the host's
+  model, temperature, max_tokens, output_schema, tools, tool_choice,
+  previous_response_id on the chat tools, plus system on messages_create;
+  input, instructions, model, temperature, max_tokens, output_schema, tools,
+  tool_choice, previous_response_id on responses_create; prompt, model,
+  temperature, max_tokens, previous_response_id on generate). Its `output_schema` constrains the host's
   completion text, which must parse as JSON validating against it, reusing
   the output_schema validation machinery. Both gates sit around the era
   dispatch, so the legacy and modern paths share them identically.
@@ -124,6 +131,55 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   fence), so a plain-text answer to a degraded tools request is never
   misread as tool calls. The persona output gate validates the completion
   text before the response object is built, identically on both eras.
+- Host-owned session cursors: multi-turn continuations need no server state.
+  All four completion tools accept an optional `previous_response_id`, and
+  every completion response carries a cursor the caller passes back to
+  continue the conversation. The cursor is `cur_` + the sha256 hex of the
+  canonical JSON `{"model","tool","transcript"}` (sorted keys, compact
+  separators: `json.dumps(..., sort_keys=True, separators=(",", ":"))`
+  encoded as UTF-8), where the transcript is the conversation through the
+  assistant turn being committed, as `{"role","content"}` entries. Per-tool
+  canonicalization: `chat_complete` uses the caller's message list verbatim
+  (system messages stay in the list); `messages_create` puts the flattened
+  system prompt first (when given), then the messages with block content
+  flattened; `responses_create` puts `instructions` first as a system entry
+  (when given), then the input items in order with text flattened (a string
+  input is one user turn; system/developer items keep their own roles);
+  `generate` is `[{"role":"user","content":<prompt>}]`. The assistant entry
+  carries the completion text exactly as the sampling layer returned it (for
+  `responses_create`, the output_text string before function_call splitting).
+  The commitment covers the tool name (cursors do not replay across tools)
+  and the model alias (a model change breaks the chain loudly), and it is
+  deterministic: any caller can recompute a cursor from the transcript it
+  holds, which is also how the server verifies without keeping state.
+  `previous_response_id` has four forms: omitted (None) means the cursor
+  protocol is off and the tool returns exactly its legacy shape; `""` starts
+  a cursor chain (nothing verified); `cur_<64 hex>` continues a verified
+  chain, recomputed over the history passed back cut at its last assistant
+  message, failing loud naming expected vs received on mismatch (modified
+  history, a different model or tool, or a foreign cursor); `resp_<32 hex>`
+  is an opaque `responses_create` response id, which commits to nothing and
+  therefore anchors a new verifiable chain at the passed history instead of
+  failing. Anything else fails loud as an unrecognized cursor format. To
+  branch from an earlier turn, truncate the history to that turn and pass its
+  cursor: the server verifies exactly what it is given. Return shape when the
+  protocol is active: the text tools return JSON text
+  `{"completion":"<the exact legacy text>","response_id":"cur_<...>"}` (keys
+  sorted); callers that omit `previous_response_id` never see the envelope.
+  For `responses_create` the `id` field IS the cursor: on the cursor path it
+  carries the `cur_` commitment, on the legacy path it stays the opaque
+  `resp_` unique id. (One `resp_` id cannot be both unique-per-call and a
+  deterministic commitment without server state, hence the two id shapes.)
+  `generate` is the documented exception: the thin path has no structured
+  history channel (the prompt is the only input), so a `cur_` cursor can
+  never be verified there; passing one fails loud saying so instead of
+  silently skipping the check, and `""` mints a cursor over the current
+  prompt and completion. The protocol lives at the tool layer, above the era
+  dispatch: verification runs before `_complete` on both eras (on the modern
+  era it fails fast on round one, before any InputRequiredResult), the cursor
+  is minted when the completion arrives, and the host re-supplies
+  `previous_response_id` on the MRTR retry round, like `persona`.
+  `previous_response_id` is part of the persona-validated request arguments.
 
 ## Security
 
@@ -157,7 +213,16 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   empty-text case, the capability-degraded tools path, max_tokens passthrough
   and default, output_schema/tools/persona acceptance, the
   tools/output_schema conflict, and loud rejection of non-text input parts,
-  identical on both eras where they overlap).
+  identical on both eras where they overlap), and the cursor protocol
+  (previous_response_id advertised on all four completion tools; the pinned
+  canonical cursor computation; chain start, verified continuation, tamper
+  mismatch failing loud naming expected vs received, malformed cursors,
+  opaque resp_ anchoring, and the legacy shape untouched when the parameter
+  is omitted; the multi-turn happy path on both eras with cross-era cursor
+  agreement; responses_create id-as-cursor on the cursor path and the opaque
+  resp_ id on the legacy path; the generate thin-path verification limit;
+  branch-by-truncation; MRTR round-one verification before any
+  InputRequiredResult).
 - `ruff format` and `ruff check` clean.
 - Standing implementation gate: testteeth mutation run on touched code
   (see commit log for the score).

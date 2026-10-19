@@ -2227,3 +2227,642 @@ def test_responses_object_arguments_sorted_keys_unit():
             "arguments": '{"city": "x", "unit": "m"}',
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# Item 6: host-owned session cursors (previous_response_id / response_id)
+# ---------------------------------------------------------------------------
+
+
+def _counting_sampler_factory():
+    """Stand in for a host whose reply differs per call, so consecutive turns
+    are distinguishable in the transcript."""
+
+    calls = []
+
+    async def sampler(context, params):
+        calls.append(params)
+        return types.CreateMessageResult(
+            role="assistant",
+            content=types.TextContent(type="text", text=f"reply-{len(calls)}"),
+            model="test-host-model",
+            stop_reason="endTurn",
+        )
+
+    return sampler, calls
+
+
+def _envelope_payload(result):
+    """The cursor-active return shape for the text tools: JSON text carrying
+    the completion and the response cursor."""
+    assert not result.is_error
+    payload = json.loads(_tool_text(result))
+    assert set(payload) == {"completion", "response_id"}
+    return payload
+
+
+def test_previous_response_id_exposed_in_tool_schemas():
+    """All four completion tools advertise previous_response_id; the ctx param
+    stays hidden."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            for name in ("chat_complete", "messages_create", "responses_create", "generate"):
+                tool = next(t for t in tools.tools if t.name == name)
+                props = tool.input_schema.get("properties", {})
+                assert "previous_response_id" in props
+                assert "ctx" not in props
+
+    _run(go)
+
+
+def test_cursor_minting_unit():
+    """The cursor is 'cur_' + sha256 over the exact canonical JSON
+    {"model","tool","transcript"} with sorted keys and compact separators: the
+    pinned vector below is the contract any caller reimplementation must match."""
+    transcript = [{"role": "user", "content": "Hi"}]
+    cursor = agent_server._mint_cursor("chat_complete", "agent-default", transcript)
+    assert cursor == "cur_109fa07a1114ce07cc8e28e24342ad0b16c67397e1fa998f26c505dee92adbb7"
+    # Deterministic across calls.
+    assert agent_server._mint_cursor("chat_complete", "agent-default", transcript) == cursor
+    # Sensitive to every committed field.
+    assert agent_server._mint_cursor("messages_create", "agent-default", transcript) != cursor
+    assert agent_server._mint_cursor("chat_complete", "other-model", transcript) != cursor
+    assert (
+        agent_server._mint_cursor(
+            "chat_complete",
+            "agent-default",
+            [*transcript, {"role": "assistant", "content": "yo"}],
+        )
+        != cursor
+    )
+
+
+def test_cursor_predicates_unit():
+    """The format gates accept exactly the documented shapes."""
+    assert agent_server._is_cursor("cur_" + "a" * 64)
+    assert not agent_server._is_cursor("cur_" + "a" * 63)
+    assert not agent_server._is_cursor("cur_" + "a" * 65)
+    assert not agent_server._is_cursor("cur_" + "z" * 64)  # non-hex
+    assert not agent_server._is_cursor("CUR_" + "a" * 64)
+    assert not agent_server._is_cursor("resp_" + "a" * 32)
+    assert not agent_server._is_cursor("")
+    assert agent_server._is_opaque_response_id("resp_" + "b" * 32)
+    assert not agent_server._is_opaque_response_id("resp_" + "b" * 31)
+    assert not agent_server._is_opaque_response_id("resp_" + "z" * 32)
+    assert not agent_server._is_opaque_response_id("cur_" + "b" * 64)
+    assert not agent_server._is_opaque_response_id("")
+
+
+def test_cursor_envelope_legacy_era():
+    """Legacy era, cursor chain start (''): the completion returns in the
+    envelope {"completion", "response_id"}, with the completion text exactly
+    as the legacy path returns it and the cursor recomputable by the caller
+    from the documented canonical form."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Say hi."}],
+                    "previous_response_id": "",
+                },
+            )
+            payload = _envelope_payload(result)
+            assert payload["completion"] == "reply-1"
+            assert payload["response_id"] == agent_server._mint_cursor(
+                "chat_complete",
+                "agent-default",
+                [
+                    {"role": "user", "content": "Say hi."},
+                    {"role": "assistant", "content": "reply-1"},
+                ],
+            )
+            # The envelope wire shape is pinned: keys sorted, so a sort_keys
+            # flip changes this string.
+            assert (
+                _tool_text(result)
+                == '{"completion": "reply-1", "response_id": "' + payload["response_id"] + '"}'
+            )
+
+    _run(go)
+
+
+def test_cursor_envelope_modern_era_full_loop():
+    """Modern era, full MRTR loop: the same envelope contract. Round one still
+    returns the InputRequiredResult untouched (no completion yet, so no cursor)."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, sampling_callback=sampler) as client:
+            first = await client.session.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Say hi."}],
+                    "previous_response_id": "",
+                },
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+
+            result = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Say hi."}],
+                    "previous_response_id": "",
+                },
+            )
+            payload = _envelope_payload(result)
+            assert payload["completion"] == "reply-1"
+            assert payload["response_id"].startswith("cur_")
+
+    _run(go)
+
+
+def test_multiturn_continuation_happy_path_both_eras():
+    """The multi-turn flow: call 1 mints cursor A; call 2 passes A back with
+    the accumulated history and gets cursor B over the longer transcript.
+    Both eras, and the cursors agree across eras: the protocol lives at the
+    tool layer, above the era dispatch."""
+
+    async def run_turns(mode_kwargs):
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, sampling_callback=sampler, **mode_kwargs) as client:
+            first = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Who are you?"}],
+                    "previous_response_id": "",
+                },
+            )
+            cursor_a = _envelope_payload(first)["response_id"]
+
+            history = [
+                {"role": "user", "content": "Who are you?"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": "user", "content": "And your mission?"},
+            ]
+            second = await client.call_tool(
+                "chat_complete",
+                {"messages": history, "previous_response_id": cursor_a},
+            )
+            payload = _envelope_payload(second)
+            assert payload["completion"] == "reply-2"
+            cursor_b = payload["response_id"]
+            assert cursor_b != cursor_a
+            assert cursor_b == agent_server._mint_cursor(
+                "chat_complete",
+                "agent-default",
+                [*history, {"role": "assistant", "content": "reply-2"}],
+            )
+            return cursor_a, cursor_b
+
+    async def go():
+        legacy_a, legacy_b = await run_turns({"mode": "legacy"})
+        modern_a, modern_b = await run_turns({})
+        assert legacy_a == modern_a
+        assert legacy_b == modern_b
+
+    _run(go)
+
+
+def test_tampered_history_fails_loud():
+    """Tampered history with a valid cursor fails loud, naming expected vs
+    received. Variants: a user turn edited, an assistant turn edited, and the
+    model changed between turns."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            first = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Who are you?"}],
+                    "previous_response_id": "",
+                },
+            )
+            cursor_a = _envelope_payload(first)["response_id"]
+
+            good_history = [
+                {"role": "user", "content": "Who are you?"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": "user", "content": "More?"},
+            ]
+            tampered_user = [
+                {"role": "user", "content": "Who are you, REALLY?"},
+                {"role": "assistant", "content": "reply-1"},
+                {"role": "user", "content": "More?"},
+            ]
+            tampered_assistant = [
+                {"role": "user", "content": "Who are you?"},
+                {"role": "assistant", "content": "reply-1, altered"},
+                {"role": "user", "content": "More?"},
+            ]
+            for bad_history in (tampered_user, tampered_assistant):
+                result = await client.call_tool(
+                    "chat_complete",
+                    {"messages": bad_history, "previous_response_id": cursor_a},
+                )
+                assert result.is_error
+                text = _tool_text(result)
+                assert "previous_response_id mismatch" in text
+                assert "expected" in text and "received" in text
+                assert f"received {cursor_a}" in text
+                # The expected cursor is named too, and it differs.
+                assert f"expected {cursor_a}" not in text
+
+            wrong_model = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": good_history,
+                    "model": "other-model",
+                    "previous_response_id": cursor_a,
+                },
+            )
+            assert wrong_model.is_error
+            assert "previous_response_id mismatch" in _tool_text(wrong_model)
+
+    _run(go)
+
+
+def test_previous_response_id_malformed_and_missing_assistant():
+    """Unrecognized cursor formats fail loud; a cur_ cursor with no assistant
+    message in the history fails loud instead of verifying against nothing."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            bad_format = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "previous_response_id": "bogus",
+                },
+            )
+            assert bad_format.is_error
+            assert "unrecognized format" in _tool_text(bad_format)
+
+            no_assistant = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "previous_response_id": "cur_" + "a" * 64,
+                },
+            )
+            assert no_assistant.is_error
+            assert "no assistant message" in _tool_text(no_assistant)
+
+    _run(go)
+
+
+def test_omitted_previous_response_id_keeps_legacy_shape():
+    """Regression guard: without previous_response_id the tool returns plain
+    text exactly as before, no envelope."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "chat_complete", {"messages": [{"role": "user", "content": "Hi"}]}
+            )
+            assert _tool_text(result) == "reply-1"
+
+    _run(go)
+
+
+def test_messages_create_multiturn_with_system():
+    """messages_create continuation: the system prompt is part of the committed
+    transcript, so changing it between turns breaks the chain loudly."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, sampling_callback=sampler) as client:
+            first = await client.call_tool(
+                "messages_create",
+                {
+                    "system": "Be terse.",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "previous_response_id": "",
+                },
+            )
+            payload = _envelope_payload(first)
+            assert payload["response_id"] == agent_server._mint_cursor(
+                "messages_create",
+                "agent-default",
+                [
+                    {"role": "system", "content": "Be terse."},
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "reply-1"},
+                ],
+            )
+
+            changed_system = await client.call_tool(
+                "messages_create",
+                {
+                    "system": "Be verbose.",
+                    "messages": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More"},
+                    ],
+                    "previous_response_id": payload["response_id"],
+                },
+            )
+            assert changed_system.is_error
+            assert "previous_response_id mismatch" in _tool_text(changed_system)
+
+    _run(go)
+
+
+def test_generate_cursor_mints_and_thin_path_limit():
+    """generate mints a cursor over (prompt, completion) when asked with '';
+    a cur_ cursor fails loud: the thin path has no structured history channel
+    to verify it against, and the server will not silently skip the check."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "generate", {"prompt": "Say hi.", "previous_response_id": ""}
+            )
+            payload = _envelope_payload(result)
+            assert payload["completion"] == "reply-1"
+            assert payload["response_id"] == agent_server._mint_cursor(
+                "generate",
+                "agent-default",
+                [
+                    {"role": "user", "content": "Say hi."},
+                    {"role": "assistant", "content": "reply-1"},
+                ],
+            )
+
+            no_verify = await client.call_tool(
+                "generate",
+                {"prompt": "Say hi again.", "previous_response_id": payload["response_id"]},
+            )
+            assert no_verify.is_error
+            assert "no structured history channel" in _tool_text(no_verify)
+
+    _run(go)
+
+
+def test_responses_create_id_is_cursor():
+    """The id field IS the cursor on responses_create. Legacy calls (no
+    previous_response_id) keep the opaque 'resp_' unique id; cursor-active
+    calls carry the tamper-evident 'cur_' commitment in id, verified against
+    the history passed back."""
+
+    async def go():
+        legacy_sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=legacy_sampler) as client:
+            legacy = await client.call_tool("responses_create", {"input": "Hi"})
+            assert _response_payload(legacy)["id"].startswith("resp_")
+
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            first = await client.call_tool(
+                "responses_create", {"input": "Hi", "previous_response_id": ""}
+            )
+            payload = _response_payload(first)
+            cursor_a = payload["id"]
+            assert cursor_a.startswith("cur_")
+            text_a = payload["output"][0]["content"][0]["text"]
+            assert text_a == "reply-1"
+            assert cursor_a == agent_server._mint_cursor(
+                "responses_create",
+                "agent-default",
+                [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "reply-1"},
+                ],
+            )
+
+            second = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More?"},
+                    ],
+                    "previous_response_id": cursor_a,
+                },
+            )
+            payload_b = _response_payload(second)
+            cursor_b = payload_b["id"]
+            assert cursor_b.startswith("cur_") and cursor_b != cursor_a
+
+            tampered = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {"role": "user", "content": "Hi, altered"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More?"},
+                    ],
+                    "previous_response_id": cursor_a,
+                },
+            )
+            assert tampered.is_error
+            assert "previous_response_id mismatch" in _tool_text(tampered)
+
+    _run(go)
+
+
+def test_responses_create_opaque_id_anchors_new_chain():
+    """A legacy 'resp_' response id passed as previous_response_id cannot be
+    verified (opaque by construction), so it anchors a new verifiable chain
+    at the history passed back instead of failing: the next response carries
+    a 'cur_' cursor, and the chain verifies from there."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            legacy = await client.call_tool("responses_create", {"input": "Hi"})
+            opaque = _response_payload(legacy)["id"]
+            assert opaque.startswith("resp_")
+
+            continued = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More?"},
+                    ],
+                    "previous_response_id": opaque,
+                },
+            )
+            payload = _response_payload(continued)
+            assert payload["id"].startswith("cur_")
+
+            again = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {"role": "user", "content": "Hi"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More?"},
+                        {"role": "assistant", "content": "reply-2"},
+                        {"role": "user", "content": "Even more?"},
+                    ],
+                    "previous_response_id": payload["id"],
+                },
+            )
+            assert not again.is_error
+            assert _response_payload(again)["id"].startswith("cur_")
+
+    _run(go)
+
+
+def test_mrtr_round_one_verifies_before_input_required():
+    """Modern era: a tampered history fails on round one, before any
+    InputRequiredResult is returned."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, sampling_callback=sampler) as client:
+            first = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "previous_response_id": "",
+                },
+            )
+            cursor_a = _envelope_payload(first)["response_id"]
+            bad = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [
+                        {"role": "user", "content": "Hi, tampered"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "More?"},
+                    ],
+                    "previous_response_id": cursor_a,
+                },
+            )
+            assert bad.is_error
+            assert "previous_response_id mismatch" in _tool_text(bad)
+
+    _run(go)
+
+
+def test_branch_by_truncation():
+    """Continuing from an earlier turn: truncate the history to that turn and
+    pass its cursor; the server verifies exactly what it is given."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            first = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Q1"}],
+                    "previous_response_id": "",
+                },
+            )
+            cursor_a = _envelope_payload(first)["response_id"]
+            branched = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [
+                        {"role": "user", "content": "Q1"},
+                        {"role": "assistant", "content": "reply-1"},
+                        {"role": "user", "content": "Different Q2"},
+                    ],
+                    "previous_response_id": cursor_a,
+                },
+            )
+            payload = _envelope_payload(branched)
+            assert payload["completion"] == "reply-2"
+            assert payload["response_id"].startswith("cur_")
+
+    _run(go)
+
+
+def test_cursor_history_canonicalization_unit():
+    """Per-tool transcript canonicalization: chat keeps the caller's roles
+    verbatim; Anthropic flattens the system prompt first; Responses keeps
+    instructions leading and item roles verbatim; string input is one user turn."""
+    from agent_as_model.protocol import (
+        AnthropicContentBlock,
+        AnthropicMessage,
+        ChatMessage,
+        ResponseInputItem,
+    )
+
+    assert agent_server._cursor_history_chat(
+        [
+            ChatMessage(role="system", content="Sys."),
+            ChatMessage(role="user", content="Hi"),
+        ]
+    ) == [
+        {"role": "system", "content": "Sys."},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    assert agent_server._cursor_history_anthropic(
+        [AnthropicMessage(role="user", content="Hi")],
+        [
+            AnthropicContentBlock(type="text", text="A."),
+            AnthropicContentBlock(type="text", text="B."),
+        ],
+    ) == [
+        {"role": "system", "content": "A.\nB."},
+        {"role": "user", "content": "Hi"},
+    ]
+    assert agent_server._cursor_history_anthropic(
+        [AnthropicMessage(role="user", content="Hi")], None
+    ) == [{"role": "user", "content": "Hi"}]
+
+    assert agent_server._cursor_history_responses(
+        [
+            ResponseInputItem(role="developer", content="Dev."),
+            ResponseInputItem(role="user", content="Hi"),
+        ],
+        "Lead.",
+    ) == [
+        {"role": "system", "content": "Lead."},
+        {"role": "developer", "content": "Dev."},
+        {"role": "user", "content": "Hi"},
+    ]
+    assert agent_server._cursor_history_responses("Just hi.", None) == [
+        {"role": "user", "content": "Just hi."}
+    ]
+
+
+def test_persona_request_validation_sees_previous_response_id():
+    """The persona input_schema gate sees previous_response_id as part of the
+    request arguments."""
+
+    async def go():
+        sampler, _ = _counting_sampler_factory()
+        schema = {
+            "type": "object",
+            "properties": {"previous_response_id": {"type": "string"}},
+            "required": ["previous_response_id"],
+        }
+        persona = {"name": "chained", "input_schema": schema}
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            missing = await client.call_tool(
+                "chat_complete",
+                {"messages": [{"role": "user", "content": "Hi"}], "persona": persona},
+            )
+            assert missing.is_error
+            assert "input-schema validation" in _tool_text(missing)
+
+            present = await client.call_tool(
+                "chat_complete",
+                {
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "persona": persona,
+                    "previous_response_id": "",
+                },
+            )
+            assert not present.is_error
+            assert _envelope_payload(present)["response_id"].startswith("cur_")
+
+    _run(go)
