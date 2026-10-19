@@ -7,10 +7,12 @@ the host agent's own LLM. No API keys exist anywhere in this system.
 Tools:
   chat_complete   OpenAI chat-completions-shaped request -> completion text
   messages_create Anthropic messages-shaped request -> completion text
+  responses_create OpenAI Responses-shaped request -> Responses response object
   generate        raw prompt string -> completion text (same host model, no chat formatting)
   list_models     the model this server offers (the host's own model, aliased)
 
-Both completion tools accept an optional output_schema (a JSON Schema object).
+The chat-shaped completion tools (chat_complete, messages_create,
+responses_create) accept an optional output_schema (a JSON Schema object).
 When given, the sampling request carries exactly one tool whose input schema
 is that schema, marked as the required tool choice (the toolChoice-required
 trick): the host must answer by invoking the tool, and the server validates
@@ -65,6 +67,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Annotated, Literal
 
 import jsonschema
@@ -99,9 +102,11 @@ from agent_as_model.protocol import (
     AnthropicContentBlock,
     AnthropicMessage,
     ChatMessage,
+    ResponseInputItem,
     anthropic_to_sampling,
     extract_text,
     openai_to_sampling,
+    responses_to_sampling,
 )
 
 mcp = MCPServer(
@@ -320,6 +325,8 @@ def _validate_persona_request(persona: Persona | None, request_arguments: dict) 
     - chat_complete: {"messages", "model", "temperature", "max_tokens",
       "output_schema", "tools", "tool_choice"}
     - messages_create: the same plus "system"
+    - responses_create: {"input", "instructions", "model", "temperature",
+      "max_tokens", "output_schema", "tools", "tool_choice"}
     - generate: {"prompt", "model", "temperature", "max_tokens"}
     `messages` are the parsed message dicts (role/content), `prompt` the raw
     string. Runs before anything is sent; a violation is the caller's bug and
@@ -481,6 +488,84 @@ def _format_tool_calls(result: CreateMessageResultWithTools) -> str:
     if not calls:
         return text
     return json.dumps({"text": text, "tool_calls": calls}, sort_keys=True)
+
+
+def _parse_tool_calls_json(completion: str) -> tuple[str, list[dict]] | None:
+    """Split the documented tool-use passthrough JSON into (text, calls).
+
+    Returns None when the completion is not the passthrough shape; only then
+    does the completion stay a single message item. Never raises: a host that
+    answered in plain prose (even with tools offered) keeps its text untouched.
+    """
+    try:
+        parsed = json.loads(completion)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    calls = parsed.get("tool_calls")
+    if not isinstance(calls, list) or "text" not in parsed:
+        return None
+    text = parsed["text"]
+    return (text if isinstance(text, str) else "", calls)
+
+
+def _responses_object(completion: str, model: str, *, used_tools: bool) -> dict:
+    """Wrap a completion in the OpenAI Responses API response object.
+
+    {"id": "resp_<unique>", "object": "response", "model": <model alias>,
+     "output": [{"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": <completion>}]}]}
+
+    The id is unique per call (uuid4 hex). When tools were actually forwarded
+    to the host (the caller passed tools AND the host advertised
+    sampling.tools) and the host answered with tool calls, the completion
+    text carries the documented passthrough shape {"text": ..., "tool_calls":
+    [...]}; it is split into output items in the Responses shape: the
+    accompanying text becomes a message item (omitted when empty), and each
+    tool call becomes a function_call item
+    {"type": "function_call", "id": "fc_<call id>", "call_id": "<call id>",
+     "name": <name>, "arguments": "<JSON>"}.
+
+    The id/call_id split mirrors the Responses API: the host's tool-call id
+    is the only id the server sees, so it maps to call_id (the identifier the
+    client echoes when submitting tool outputs), and the object id is derived
+    from it with the fc_ prefix. arguments is the JSON string of the tool
+    input, keys sorted, matching the server's canonical JSON convention. The
+    server never executes the calls.
+    """
+    text = completion
+    calls: list[dict] = []
+    if used_tools:
+        parsed = _parse_tool_calls_json(completion)
+        if parsed is not None:
+            text, calls = parsed
+    output: list[dict] = []
+    if text or not calls:
+        output.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        )
+    for call in calls:
+        call_id = str(call.get("id", ""))
+        output.append(
+            {
+                "type": "function_call",
+                "id": f"fc_{call_id}",
+                "call_id": call_id,
+                "name": call.get("name"),
+                "arguments": json.dumps(call.get("input", {}), sort_keys=True),
+            }
+        )
+    return {
+        "id": "resp_" + uuid.uuid4().hex,
+        "object": "response",
+        "model": model,
+        "output": output,
+    }
 
 
 async def _legacy_sample(
@@ -888,6 +973,168 @@ async def messages_create(
     )
     return _finish_persona(
         persona, await _complete(ctx, params, output_schema, tools=validated_tools)
+    )
+
+
+@mcp.tool(
+    description=(
+        "Generate a completion from an OpenAI Responses-shaped request, returning "
+        "the Responses API response object. The completion is produced by the host "
+        "agent's own model: direct MCP sampling on pre-2026-07-28 connections, an "
+        "MRTR InputRequiredResult carrying the request payload on 2026-07-28+. "
+        "`input` is a string or a list of input items; each item is {role, content} "
+        "with role user, assistant, system, or developer, and content a string or a "
+        "list of text parts ({type: 'input_text'|'text', input_text: '...'}). A string "
+        "input becomes one user message. System and developer items fold into the "
+        "system prompt alongside `instructions`, which leads. Non-text parts are "
+        "rejected. `max_tokens` is named for uniformity with the other tools (the "
+        "Responses API calls it max_output_tokens); same meaning. "
+        "When output_schema is given, the request carries exactly one required tool "
+        "whose input schema is that schema, and the validated structured completion "
+        "is returned as JSON text inside the output_text. "
+        "When tools is given, the tool definitions are forwarded to the host's model "
+        "with tool_choice, but only if the host advertised the sampling.tools "
+        "capability: otherwise the tools are dropped (a warning is logged server-side) "
+        "and the call degrades to a plain-text completion. "
+        "When the host answers by calling tools, the output array carries the "
+        "accompanying text as a message item (omitted when empty) followed by one "
+        "function_call item per call: {type: 'function_call', id: 'fc_<call id>', "
+        "call_id: '<host tool-call id>', name: '...', arguments: '<JSON>'}; the host's "
+        "tool-call id maps to call_id, the object id is derived from it. A plain-text "
+        "host answer returns a single message item. tools and output_schema cannot "
+        "be combined. "
+        "An optional persona {name, input_schema, output_schema} registers a "
+        "per-call contract: the request arguments are validated against "
+        "input_schema before anything is sent, and the host's completion text "
+        "must parse as JSON validating against output_schema. The server is "
+        "stateless and keeps no persona registry. persona.output_schema and "
+        "output_schema cannot be combined. "
+        "No API key is used or needed: the connected agent is the model."
+    )
+)
+async def responses_create(
+    ctx: Context,
+    input: Annotated[
+        str | list[ResponseInputItem],
+        Field(
+            description=(
+                "The Responses API input: a string, which becomes one user "
+                "message, or a list of input items {role, content}. role is "
+                "user, assistant, system, or developer; content is a string or "
+                "a list of text parts ({type: 'input_text'|'text', input_text: "
+                "'...'}). System and developer items fold into the system "
+                "prompt alongside instructions. Non-text parts are rejected."
+            )
+        ),
+    ],
+    instructions: Annotated[
+        str | None,
+        Field(description="Optional system prompt; leads the system/developer items."),
+    ] = None,
+    model: Annotated[
+        str, Field(description="Model alias; agent-default means the host's own model.")
+    ] = "agent-default",
+    temperature: Annotated[
+        float | None, Field(description="Sampling temperature, if the host honors it.")
+    ] = None,
+    max_tokens: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum tokens to generate. Named max_tokens for uniformity "
+                "with the other tools; the Responses API calls it "
+                "max_output_tokens."
+            )
+        ),
+    ] = 4096,
+    output_schema: Annotated[
+        dict | None,
+        Field(
+            description=(
+                "Optional JSON Schema (root type object). When given, the sampling "
+                "request carries exactly one required tool with this input schema "
+                "and the completion is validated against it before returning."
+            )
+        ),
+    ] = None,
+    tools: Annotated[
+        list[ToolDefinition] | None,
+        Field(
+            description=(
+                "Optional tool definitions to forward to the host's model. Each is "
+                "{name, description, input_schema} where input_schema is a JSON "
+                "Schema object with root type 'object'. Forwarded only when the "
+                "host advertised the sampling.tools capability; otherwise dropped "
+                "with a server-side warning and the call degrades to plain text."
+            )
+        ),
+    ] = None,
+    tool_choice: Annotated[
+        Literal["auto", "required", "none"] | None,
+        Field(
+            description=(
+                "Optional tool-choice mode, forwarded with tools; defaults to "
+                "'auto' when tools are given."
+            )
+        ),
+    ] = None,
+    persona: Annotated[
+        Persona | None,
+        Field(
+            description=(
+                "Optional persona contract for this call: {name, input_schema, "
+                "output_schema}. name is required and non-empty; the server is "
+                "stateless and keeps no persona registry. When input_schema is "
+                "given, the request arguments (input, instructions, model, "
+                "temperature, max_tokens, output_schema, tools, tool_choice) "
+                "are validated against it before anything is sent. When "
+                "output_schema is given, the host's completion text must parse "
+                "as JSON validating against it. persona.output_schema and "
+                "output_schema cannot be combined."
+            )
+        ),
+    ] = None,
+) -> dict | InputRequiredResult:
+    """Complete a Responses API request with the host agent's model."""
+    persona = _validate_persona(persona)
+    _check_output_schema_persona_conflict(output_schema, persona)
+    validated_tools = _validate_tool_definitions(tools)
+    system_prompt, sampling_messages = responses_to_sampling(input, instructions)
+    _validate_persona_request(
+        persona,
+        {
+            "input": [item.model_dump() for item in input] if isinstance(input, list) else input,
+            "instructions": instructions,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "output_schema": output_schema,
+            "tools": [tool.model_dump() for tool in validated_tools] if validated_tools else None,
+            "tool_choice": tool_choice,
+        },
+    )
+    params = _sampling_params(
+        sampling_messages,
+        system_prompt,
+        temperature,
+        max_tokens,
+        model,
+        output_schema,
+        tools=validated_tools,
+        tool_choice=tool_choice,
+    )
+    completed = _finish_persona(
+        persona, await _complete(ctx, params, output_schema, tools=validated_tools)
+    )
+    if isinstance(completed, InputRequiredResult):
+        return completed
+    # The predicate mirrors the capability fence inside _complete: tools count
+    # as used exactly when they were forwarded to the host, so a plain-text
+    # answer to a degraded tools request is never misread as tool calls.
+    return _responses_object(
+        completed,
+        model,
+        used_tools=validated_tools is not None and _sampling_tools_supported(ctx),
     )
 
 

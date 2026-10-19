@@ -1633,3 +1633,597 @@ def test_generate_lists_persona():
             assert "tool_choice" not in props
 
     _run(go)
+
+
+# ---------------------------------------------------------------------------
+# Item 5: responses_create (OpenAI Responses API shape)
+# ---------------------------------------------------------------------------
+
+
+def _response_payload(result):
+    """The tool returns a dict; the server serializes it as a JSON text block."""
+    assert not result.is_error
+    return json.loads(_tool_text(result))
+
+
+def test_responses_create_listed_and_schema():
+    """responses_create is listed with the Responses request surface: input,
+    instructions, model, temperature, max_tokens, output_schema, tools,
+    tool_choice, persona; the ctx param stays hidden."""
+
+    async def go():
+        async with Client(SERVER) as client:
+            tools = await client.list_tools()
+            names = {t.name for t in tools.tools}
+            assert "responses_create" in names
+            tool = next(t for t in tools.tools if t.name == "responses_create")
+            props = tool.input_schema.get("properties", {})
+            assert "ctx" not in props
+            assert {
+                "input",
+                "instructions",
+                "model",
+                "temperature",
+                "max_tokens",
+                "output_schema",
+                "tools",
+                "tool_choice",
+                "persona",
+            } <= set(props)
+            assert "input" in tool.input_schema.get("required", [])
+
+    _run(go)
+
+
+def test_responses_create_modern_era_string_input_shape():
+    """Modern era, full MRTR loop with a string input: the tool returns the
+    Responses response object with a resp_-prefixed unique id, object
+    'response', the model alias echoed, and a single message item whose
+    output_text carries the completion."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": "Say hi.",
+                    "model": "agent-default",
+                    "temperature": 0.5,
+                    "max_tokens": 100,
+                },
+            )
+            payload = _response_payload(result)
+            assert payload["id"].startswith("resp_")
+            assert len(payload["id"]) == len("resp_") + 32
+            assert payload["object"] == "response"
+            assert payload["model"] == "agent-default"
+            text = payload["output"][0]["content"][0]["text"]
+            seen = json.loads(text.removeprefix("CANNED:"))
+            assert payload["output"] == [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ]
+            assert seen["messages"] == [["user", "Say hi."]]
+            assert seen["system_prompt"] is None
+            assert seen["temperature"] == 0.5
+            assert seen["max_tokens"] == 100
+            assert seen["hints"] == ["agent-default"]
+
+    _run(go)
+
+
+def test_responses_create_ids_unique_per_call():
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            ids = []
+            for _ in range(3):
+                result = await client.call_tool("responses_create", {"input": "Hi"})
+                ids.append(_response_payload(result)["id"])
+            assert all(i.startswith("resp_") for i in ids)
+            assert len(set(ids)) == 3
+
+    _run(go)
+
+
+def test_responses_create_input_items_fold_system_and_instructions():
+    """An item list: user/assistant items become messages, system and
+    developer items fold into the system prompt alongside instructions,
+    and multi-part content joins its text."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {"role": "system", "content": "System A."},
+                        {"role": "developer", "content": "Developer B."},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "input_text": "First."},
+                                {"type": "text", "text": "Second."},
+                            ],
+                        },
+                    ],
+                    "instructions": "Instructions first.",
+                },
+            )
+            payload = _response_payload(result)
+            text = payload["output"][0]["content"][0]["text"]
+            seen = json.loads(text.removeprefix("CANNED:"))
+            assert seen["system_prompt"] == "Instructions first.\n\nSystem A.\n\nDeveloper B."
+            assert seen["messages"] == [["user", "First.\nSecond."]]
+
+    _run(go)
+
+
+def test_responses_create_legacy_era():
+    """Legacy era: direct sampling/createMessage; the Responses object still
+    echoes the model alias and carries the completion as output_text."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {"input": "Ping", "instructions": "Be terse.", "model": "custom-model"},
+            )
+            payload = _response_payload(result)
+            assert payload["object"] == "response"
+            assert payload["model"] == "custom-model"
+            text = payload["output"][0]["content"][0]["text"]
+            seen = json.loads(text.removeprefix("CANNED:"))
+            assert seen["system_prompt"] == "Be terse."
+            assert seen["messages"] == [["user", "Ping"]]
+            assert seen["hints"] == ["custom-model"]
+
+    _run(go)
+
+
+def test_responses_create_modern_era_input_required_payload():
+    """Modern era, round one: the InputRequiredResult payload carries the
+    translated messages, the system prompt, and the sampling params."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            first = await client.session.call_tool(
+                "responses_create",
+                {"input": "Say hi.", "instructions": "Be terse.", "max_tokens": 60},
+                allow_input_required=True,
+            )
+            assert isinstance(first, types.InputRequiredResult)
+            params = first.input_requests["sample"].params
+            assert params.system_prompt == "Be terse."
+            assert [(m.role, m.content.text) for m in params.messages] == [("user", "Say hi.")]
+            assert params.max_tokens == 60
+            assert first.request_state
+
+    _run(go)
+
+
+def test_responses_create_max_tokens_passthrough():
+    """max_tokens reaches the host; the default is 4096 like the other tools."""
+
+    async def go():
+        async with Client(SERVER, sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool("responses_create", {"input": "Hi", "max_tokens": 77})
+            text = _response_payload(result)["output"][0]["content"][0]["text"]
+            assert json.loads(text.removeprefix("CANNED:"))["max_tokens"] == 77
+
+            result = await client.call_tool("responses_create", {"input": "Hi"})
+            text = _response_payload(result)["output"][0]["content"][0]["text"]
+            assert json.loads(text.removeprefix("CANNED:"))["max_tokens"] == 4096
+
+    _run(go)
+
+
+def test_responses_create_output_schema():
+    """output_schema is accepted: the structured completion returns as JSON
+    text inside the output_text block. Legacy and modern eras."""
+
+    async def go():
+        sampler = _structured_sampler_factory({"answer": "yes", "confidence": 0.9})
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {"input": "Hi", "output_schema": _OUTPUT_SCHEMA},
+            )
+            payload = _response_payload(result)
+            text = payload["output"][0]["content"][0]["text"]
+            assert json.loads(text) == {"answer": "yes", "confidence": 0.9}
+
+        modern_sampler = _structured_sampler_factory({"answer": "modern"})
+        async with Client(SERVER, sampling_callback=modern_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {"input": "Hi", "output_schema": _OUTPUT_SCHEMA},
+            )
+            payload = _response_payload(result)
+            text = payload["output"][0]["content"][0]["text"]
+            assert json.loads(text) == {"answer": "modern"}
+
+    _run(go)
+
+
+def test_responses_create_tools_become_function_call_items():
+    """Legacy era: tools are accepted; when the host answers with tool calls,
+    the output array carries the accompanying text as a message item followed
+    by function_call items in the documented shape."""
+
+    tool_calls = [
+        {"name": "get_weather", "id": "call-1", "input": {"unit": "metric", "city": "Naga"}}
+    ]
+
+    async def go():
+        sampler = _tool_call_sampler_factory(tool_calls, text="checking")
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=sampler,
+            sampling_capabilities=_TOOLS_CAPABILITY,
+        ) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {"input": "Hi", "tools": _TOOL_DEFS, "tool_choice": "auto"},
+            )
+            payload = _response_payload(result)
+            assert payload["output"] == [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "checking"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_call-1",
+                    "call_id": "call-1",
+                    "name": "get_weather",
+                    # Insertion order was unit, city: arguments are canonical
+                    # sorted JSON, so a sort_keys flip changes this string.
+                    "arguments": '{"city": "Naga", "unit": "metric"}',
+                },
+            ]
+
+    _run(go)
+
+
+def test_responses_create_function_calls_omit_empty_message_item():
+    """When the host's tool-call answer has no accompanying text, the output
+    array carries only the function_call items."""
+
+    tool_calls = [{"name": "search", "id": "c-2", "input": {"query": "y"}}]
+
+    async def go():
+        sampler = _tool_call_sampler_factory(tool_calls)
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=sampler,
+            sampling_capabilities=_TOOLS_CAPABILITY,
+        ) as client:
+            result = await client.call_tool(
+                "responses_create", {"input": "Hi", "tools": _TOOL_DEFS}
+            )
+            payload = _response_payload(result)
+            assert payload["output"] == [
+                {
+                    "type": "function_call",
+                    "id": "fc_c-2",
+                    "call_id": "c-2",
+                    "name": "search",
+                    "arguments": '{"query": "y"}',
+                }
+            ]
+
+    _run(go)
+
+
+def test_responses_create_modern_era_full_loop_tools():
+    """Modern era, full MRTR loop: the host's tool calls come back as
+    function_call items in the Responses object."""
+
+    tool_calls = [{"name": "get_weather", "id": "call-9", "input": {"city": "Manila"}}]
+
+    async def go():
+        sampler = _tool_call_sampler_factory(tool_calls)
+        async with Client(
+            SERVER, sampling_callback=sampler, sampling_capabilities=_TOOLS_CAPABILITY
+        ) as client:
+            result = await client.call_tool(
+                "responses_create", {"input": "Hi", "tools": _TOOL_DEFS}
+            )
+            payload = _response_payload(result)
+            assert payload["object"] == "response"
+            assert payload["output"] == [
+                {
+                    "type": "function_call",
+                    "id": "fc_call-9",
+                    "call_id": "call-9",
+                    "name": "get_weather",
+                    "arguments": '{"city": "Manila"}',
+                }
+            ]
+
+    _run(go)
+
+
+def test_responses_create_degraded_tools_stay_message_item(caplog):
+    """Legacy era: without sampling.tools the tools are dropped with a
+    server-side warning and the plain-text answer stays a single message item:
+    it is never misread as tool calls."""
+
+    async def go():
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=_no_tools_sampler,
+            sampling_capabilities=_NO_TOOLS_CAPABILITY,
+        ) as client:
+            with caplog.at_level("WARNING", logger="agent_as_model"):
+                result = await client.call_tool(
+                    "responses_create", {"input": "Hi", "tools": _TOOL_DEFS}
+                )
+            payload = _response_payload(result)
+            assert payload["output"] == [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "plain answer"}],
+                }
+            ]
+
+    _run(go)
+    assert any("sampling.tools" in record.message for record in caplog.records)
+
+
+def test_responses_create_tools_output_schema_conflict():
+    """tools and output_schema together fail loud, naming both."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {"input": "Hi", "tools": _TOOL_DEFS, "output_schema": _OUTPUT_SCHEMA},
+            )
+            assert result.is_error
+            text = _tool_text(result)
+            assert "tools" in text and "output_schema" in text
+
+    _run(go)
+
+
+def test_responses_create_persona_request_validation():
+    """persona is accepted: the input_schema gate constrains the request
+    (input, instructions, model, ...) and rejects before anything is sent."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        schema = {
+            "type": "object",
+            "properties": {"input": {"type": "string", "minLength": 5}},
+            "required": ["input"],
+        }
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            ok = await client.call_tool(
+                "responses_create",
+                {
+                    "input": "Hello world",
+                    "persona": {"name": "verbose", "input_schema": schema},
+                },
+            )
+            assert not ok.is_error
+            assert _response_payload(ok)["object"] == "response"
+
+            bad = await client.call_tool(
+                "responses_create",
+                {"input": "Hi", "persona": {"name": "verbose", "input_schema": schema}},
+            )
+            assert bad.is_error
+            text = _tool_text(bad)
+            assert "verbose" in text
+            assert "input-schema validation" in text
+            assert "before anything was sent" in text
+        # Exactly one host call: the rejected input never traveled.
+        assert len(calls) == 1
+
+    _run(go)
+
+
+def test_responses_create_persona_output_validation():
+    """persona.output_schema gates the completion text: valid JSON returns
+    inside the response object, prose fails loud naming the persona."""
+
+    async def go():
+        sampler = _json_text_sampler_factory('{"answer": "yes"}')
+        async with Client(SERVER, mode="legacy", sampling_callback=sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": "Hi",
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+            )
+            payload = _response_payload(result)
+            assert payload["output"][0]["content"][0]["text"] == '{"answer": "yes"}'
+
+        async with Client(
+            SERVER, sampling_callback=_json_text_sampler_factory("not json")
+        ) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": "Hi",
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+            )
+            assert result.is_error
+            text = _tool_text(result)
+            assert "answerer" in text
+            assert "not valid JSON" in text
+
+    _run(go)
+
+
+def test_responses_create_rejects_non_text_input_part():
+    """A non-text input part fails loud end to end."""
+
+    async def go():
+        async with Client(SERVER, mode="legacy", sampling_callback=_canned_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image_url", "image_url": "http://x/y.png"}],
+                        }
+                    ]
+                },
+            )
+            assert result.is_error
+
+    _run(go)
+
+
+def test_responses_object_plain_text_shape_unit():
+    """Unit: the response object shape for a plain-text completion."""
+    obj = agent_server._responses_object("hello", "agent-default", used_tools=False)
+    assert obj["id"].startswith("resp_")
+    assert obj["object"] == "response"
+    assert obj["model"] == "agent-default"
+    assert obj["output"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}],
+        }
+    ]
+
+
+def test_responses_object_model_echoes_alias():
+    obj = agent_server._responses_object("x", "custom-model", used_tools=False)
+    assert obj["model"] == "custom-model"
+
+
+def test_responses_object_ids_unique_unit():
+    first = agent_server._responses_object("x", "agent-default", used_tools=False)["id"]
+    second = agent_server._responses_object("x", "agent-default", used_tools=False)["id"]
+    assert first != second
+
+
+def test_parse_tool_calls_json():
+    """Unit: only the exact passthrough shape splits into (text, calls);
+    anything else stays a single message item and never raises."""
+    assert agent_server._parse_tool_calls_json("plain prose") is None
+    assert agent_server._parse_tool_calls_json('{"nope": 1}') is None
+    assert agent_server._parse_tool_calls_json('{"text": "t"}') is None
+    assert agent_server._parse_tool_calls_json('["text", "tool_calls"]') is None
+    text, calls = agent_server._parse_tool_calls_json(
+        '{"text": "t", "tool_calls": [{"id": "c", "name": "n", "input": {}}]}'
+    )
+    assert text == "t"
+    assert calls == [{"id": "c", "name": "n", "input": {}}]
+
+
+def test_responses_create_output_schema_persona_output_schema_conflict():
+    """output_schema and persona.output_schema together fail loud on
+    responses_create too, naming both, before anything is sent."""
+
+    async def go():
+        calls = []
+
+        async def recording_sampler(context, params):
+            calls.append(params)
+            return await _canned_sampler(context, params)
+
+        async with Client(SERVER, mode="legacy", sampling_callback=recording_sampler) as client:
+            result = await client.call_tool(
+                "responses_create",
+                {
+                    "input": "Hi",
+                    "output_schema": _OUTPUT_SCHEMA,
+                    "persona": {"name": "answerer", "output_schema": _OUTPUT_SCHEMA},
+                },
+            )
+            assert result.is_error
+            text = _tool_text(result)
+            assert "output_schema" in text
+            assert "persona.output_schema" in text
+        assert calls == []
+
+    _run(go)
+
+
+def test_responses_create_degraded_tools_never_misreads_prose_as_calls():
+    """The used_tools predicate mirrors the _complete capability fence: when
+    tools were dropped for a host without sampling.tools, even a plain-text
+    answer shaped like the passthrough JSON stays a single message item."""
+
+    async def prose_sampler(context, params):
+        assert params.tools is None
+        return types.CreateMessageResult(
+            role="assistant",
+            content=types.TextContent(
+                type="text",
+                text='{"text": "looks like tool calls", '
+                '"tool_calls": [{"id": "c", "name": "n", "input": {}}]}',
+            ),
+            model="test-host-model",
+            stop_reason="endTurn",
+        )
+
+    async def go():
+        async with Client(
+            SERVER,
+            mode="legacy",
+            sampling_callback=prose_sampler,
+            sampling_capabilities=_NO_TOOLS_CAPABILITY,
+        ) as client:
+            result = await client.call_tool(
+                "responses_create", {"input": "Hi", "tools": _TOOL_DEFS}
+            )
+            payload = _response_payload(result)
+            assert payload["output"] == [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"text": "looks like tool calls", '
+                            '"tool_calls": [{"id": "c", "name": "n", "input": {}}]}',
+                        }
+                    ],
+                }
+            ]
+
+    _run(go)
+
+
+def test_responses_object_arguments_sorted_keys_unit():
+    """Unit: function_call arguments are canonical sorted JSON even when the
+    passthrough text carried insertion-ordered input keys."""
+    completion = json.dumps(
+        {
+            "text": "",
+            "tool_calls": [{"id": "c-1", "name": "n", "input": {"unit": "m", "city": "x"}}],
+        }
+    )
+    obj = agent_server._responses_object(completion, "agent-default", used_tools=True)
+    assert obj["output"] == [
+        {
+            "type": "function_call",
+            "id": "fc_c-1",
+            "call_id": "c-1",
+            "name": "n",
+            "arguments": '{"city": "x", "unit": "m"}',
+        }
+    ]

@@ -62,6 +62,26 @@ the MCP connection. The agent is the model. The agent is the key.
 `system` accepts a string or a list of text blocks. Message content accepts a
 string or a list of text blocks.
 
+**responses_create** — OpenAI Responses API-shaped request, Responses API
+response object back. `input` is a string (one user message) or a list of
+input items `{role, content}`: `role` is `user`, `assistant`, `system`, or
+`developer`; `content` is a string or a list of text parts
+(`{type: "input_text"|"text", input_text: "..."}`). System and developer
+items fold into the system prompt alongside `instructions`, which leads.
+Non-text parts are rejected. `max_tokens` keeps the name from the other
+tools (the Responses API calls it `max_output_tokens`). `output_schema`,
+`tools`, `tool_choice`, and `persona` behave exactly as on the other
+completion tools.
+
+The returned object is `{"id": "resp_<unique>", "object": "response",
+"model": <the model alias passed in>, "output": [...]}`. A plain-text host
+answer becomes a single `message` item with one `output_text` block. When
+the host answers by calling tools, the accompanying text (when non-empty)
+becomes a message item and each tool call becomes a `function_call` item:
+`{"type": "function_call", "id": "fc_<call id>", "call_id": "<host
+tool-call id>", "name": "...", "arguments": "<JSON>"}`; the host's
+tool-call id maps to `call_id` and the object id is derived from it.
+
 **generate** — raw prompt string in, completion text out, same host model, no
 chat formatting. The thin path for callers that do not need chat shapes: the
 prompt is sent as a single user sampling message with no system prompt and no
@@ -74,7 +94,7 @@ request/response validation only and adds no sampling overhead.
 **list_models** — returns the one model this server offers: `agent-default`,
 an alias for the host agent's own model.
 
-**Structured output** — both completion tools accept an optional
+**Structured output** — the three chat-shaped completion tools accept an optional
 `output_schema` (a JSON Schema object with root type `object`). When given,
 the sampling request carries exactly one tool whose input schema is that
 schema, marked as the required tool choice: the host must answer by invoking
@@ -84,7 +104,7 @@ answer that violates the schema fails loudly; bad output is never returned
 silently. The schema itself is validated up front, so a malformed schema is
 the caller's error, not a mid-flow surprise.
 
-**Tool-use passthrough** — both completion tools also accept `tools`, a list
+**Tool-use passthrough** — the three chat-shaped completion tools also accept `tools`, a list
 of tool definitions (`{name, description, input_schema}` with `input_schema`
 a JSON Schema object with root type `object`), and `tool_choice`
 (`auto`/`required`/`none`, default `auto`). The definitions are validated up
@@ -100,8 +120,8 @@ A plain-text host answer returns text as before. Passing both `tools` and
 `output_schema` is an error: `output_schema` is already implemented as one
 required tool, so combining them is contradictory.
 
-**Personas** — all three completion tools (`chat_complete`,
-`messages_create`, and `generate`) accept an optional `persona`
+**Personas** — all four completion tools (`chat_complete`,
+`messages_create`, `responses_create`, and `generate`) accept an optional `persona`
 (`{name, input_schema, output_schema}`). The server is stateless: there is
 no persona registry, the host supplies the persona per call, and the same
 validation runs on both protocol eras. Before anything is sent, the persona

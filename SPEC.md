@@ -22,13 +22,15 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
                                    no keys here
 ```
 
-- `protocol.py`: pure translation. OpenAI chat messages and Anthropic
-  messages into `SamplingMessage` lists plus a system prompt. Text
-  extraction from sampling results. No I/O, no keys.
-- `server.py`: `MCPServer` (official Python SDK v2) over stdio with four
+- `protocol.py`: pure translation. OpenAI chat messages, Anthropic
+  messages, and Responses API input items into `SamplingMessage` lists plus
+  a system prompt. Text extraction from sampling results. No I/O, no keys.
+- `server.py`: `MCPServer` (official Python SDK v2) over stdio with five
   tools: `chat_complete` and `messages_create` (chat-shaped completion), the
-  raw `generate` tool (a plain prompt sent as a single user sampling message
-  with no system prompt, no chat formatting overhead), and `list_models`.
+  Responses-shaped `responses_create` (Responses request in, Responses
+  response object out), the raw `generate` tool (a plain prompt sent as a
+  single user sampling message with no system prompt, no chat formatting
+  overhead), and `list_models`.
   Sampling goes through `Resolve`/`Sample` resolver injection, which
   is the era-portable form: direct `sampling/createMessage` before
   2026-07-28, `InputRequiredResult` multi-round-trip on 2026-07-28+.
@@ -93,6 +95,35 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
 - `generate` accepts `persona`: it is a completion tool on the same host
   model, and persona is request/response validation only, never a sampling
   feature, so the thin path stays zero overhead.
+- `responses_create` speaks the Responses API request/response shape mapped
+  onto the same sampling machinery. Request: `input` (string or list of input
+  items), `instructions` (optional system prompt), `model` (default
+  "agent-default"), `temperature`, `max_tokens` (named for uniformity with
+  the other tools, not `max_output_tokens`), plus the same optional
+  `output_schema`, `tools`, `tool_choice`, and `persona` as the other
+  completion tools: they ride the shared `_complete` era dispatch, so this
+  is wiring, not new machinery. Input translation lives in `protocol.py`:
+  a string `input` becomes one user message; an item list maps roles to
+  messages, with system/developer items folding into the system prompt
+  alongside `instructions` (which leads), and content as a string or a list
+  of `input_text`/`text` parts; non-text parts and unknown roles are
+  rejected at parse time. Response: `{"id": "resp_<uuid4 hex>", "object":
+  "response", "model": <the model alias passed in>, "output": [...]}` with
+  a unique id per call. A plain-text completion becomes one `message` item
+  with a single `output_text` block; a tool-calling host answer becomes the
+  accompanying text as a message item (omitted when empty) followed by one
+  `function_call` item per call: `{"type": "function_call", "id":
+  "fc_<call id>", "call_id": "<host tool-call id>", "name": ...,
+  "arguments": "<JSON string>"}`. The host's tool-call id is the only id the
+  server sees, so it maps to the Responses `call_id` (the identifier the
+  client echoes when submitting tool outputs) and the object id is derived
+  from it with the `fc_` prefix; `arguments` is the JSON string of the tool
+  input, keys sorted per the server's canonical JSON convention. The
+  tool-call split reads the documented passthrough shape only when tools
+  were actually forwarded (the same predicate as the `_complete` capability
+  fence), so a plain-text answer to a degraded tools request is never
+  misread as tool calls. The persona output gate validates the completion
+  text before the response object is built, identically on both eras.
 
 ## Security
 
@@ -103,7 +134,11 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
 
 ## Verification
 
-- `tests/test_protocol.py`: 8 unit tests over translation and extraction.
+- `tests/test_protocol.py`: 19 unit tests over translation and extraction,
+  including the Responses translator (string input; item lists with
+  system/developer folding alongside instructions; input_text/text part
+  aliases; loud rejection of non-text parts, unknown roles, empty lists,
+  and parts with no text body).
 - `tests/test_server.py`: end-to-end tests with the in-process SDK client
   and a scripted sampling host: tool listing (Resolve param hidden from
   schemas), `chat_complete` on both protocol eras with wire-level
@@ -111,10 +146,18 @@ product/agent --tools/call--> agent-as-model --sampling--> host agent's LLM
   hints), `messages_create`, `list_models`, the no-sampling error path, and
   `generate` (prompt as a single user message with no system prompt on both
   eras, params pass-through, tool listing, description), and the persona
-  paths (advertised on all three completion tools, request-side validation
+  paths (advertised on all four completion tools, request-side validation
   success and rejection-before-sending, response-side validation success and
   loud failure, malformed-persona rejection, the
-  output_schema/persona.output_schema conflict, identical on both eras).
+  output_schema/persona.output_schema conflict, identical on both eras), and
+  `responses_create` (tool listing and schema, string input and item-list
+  input with system/developer folding and instructions, the Responses
+  response object shape with unique resp_-prefixed ids, model echo,
+  output_text blocks, function_call items on both eras including the
+  empty-text case, the capability-degraded tools path, max_tokens passthrough
+  and default, output_schema/tools/persona acceptance, the
+  tools/output_schema conflict, and loud rejection of non-text input parts,
+  identical on both eras where they overlap).
 - `ruff format` and `ruff check` clean.
 - Standing implementation gate: testteeth mutation run on touched code
   (see commit log for the score).
